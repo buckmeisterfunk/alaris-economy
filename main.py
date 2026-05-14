@@ -1,7 +1,8 @@
-# Alaris_EconomyBot_v001
+# Alaris_EconomyBot_v002
 # Full replacement for main.py
-# Purpose: first standalone Alaris Economy Bot scaffold using shared Postgres.
-# Safety rules
+# Purpose: standalone Alaris Economy Bot scaffold using shared Postgres.
+# v002: Adds safe character compatibility sync/backfill from alaris_characters.
+# Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
 # - Character economy is keyed by character_id, not character name.
@@ -29,7 +30,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v001"
+APP_VERSION = "Alaris_EconomyBot_v002"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -198,7 +199,7 @@ async def run_db(fn, *args, **kwargs):
 
 
 def ensure_schema_sync() -> None:
-    """Additive-only schema setup for EconomyBot v001."""
+    """Additive-only schema setup for EconomyBot v002."""
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS econ;")
@@ -355,6 +356,52 @@ def ensure_schema_sync() -> None:
                 """
             )
 
+            # Compatibility bridge used by EconomyBot/TournamentBot.
+            # Clean Alaris canon remains public.alaris_characters; this table is a read/write mirror.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.characters (
+                    character_id BIGINT PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT,
+                    species TEXT,
+                    class_name TEXT,
+                    kingdom TEXT,
+                    level INTEGER NOT NULL DEFAULT 1,
+                    xp_total BIGINT NOT NULL DEFAULT 0,
+                    archived BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE public.characters
+                    ADD COLUMN IF NOT EXISTS character_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS guild_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS user_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS name TEXT,
+                    ADD COLUMN IF NOT EXISTS normalized_name TEXT,
+                    ADD COLUMN IF NOT EXISTS species TEXT,
+                    ADD COLUMN IF NOT EXISTS class_name TEXT,
+                    ADD COLUMN IF NOT EXISTS kingdom TEXT,
+                    ADD COLUMN IF NOT EXISTS level INTEGER NOT NULL DEFAULT 1,
+                    ADD COLUMN IF NOT EXISTS xp_total BIGINT NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS characters_guild_character_id_uidx
+                ON public.characters (guild_id, character_id);
+                """
+            )
+
             for kingdom in CANON_KINGDOMS:
                 cur.execute(
                     """
@@ -366,6 +413,86 @@ def ensure_schema_sync() -> None:
                 )
 
         conn.commit()
+
+
+def sync_public_characters_from_alaris_sync(guild_id: int) -> dict[str, int]:
+    """Backfill the public.characters compatibility mirror from public.alaris_characters.
+
+    This is additive/non-destructive: it inserts missing compatibility rows and updates
+    display metadata for existing rows, but it never deletes character or economy data.
+    """
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'alaris_characters'
+                ) AS has_alaris_characters;
+                """
+            )
+            flags = cur.fetchone() or {}
+            if not flags.get("has_alaris_characters"):
+                return {"has_alaris_characters": 0, "alaris_found": 0, "synced": 0, "missing_kingdom": 0}
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       COUNT(*) FILTER (WHERE COALESCE(kingdom, '') = '') AS missing_kingdom
+                FROM public.alaris_characters
+                WHERE guild_id = %s
+                  AND COALESCE(status, 'active') = 'active';
+                """,
+                (guild_id,),
+            )
+            counts = cur.fetchone() or {}
+            alaris_found = int(counts.get("n") or 0)
+            missing_kingdom = int(counts.get("missing_kingdom") or 0)
+
+            cur.execute(
+                """
+                INSERT INTO public.characters (
+                    guild_id, character_id, user_id, name, normalized_name, species, class_name,
+                    kingdom, level, xp_total, archived, created_at, updated_at
+                )
+                SELECT
+                    guild_id,
+                    id AS character_id,
+                    user_id,
+                    name,
+                    COALESCE(normalized_name, lower(name)) AS normalized_name,
+                    COALESCE(species, '') AS species,
+                    COALESCE(class_name, '') AS class_name,
+                    NULLIF(COALESCE(kingdom, ''), '') AS kingdom,
+                    COALESCE(level, 1) AS level,
+                    COALESCE(xp_total, 0) AS xp_total,
+                    CASE WHEN COALESCE(status, 'active') = 'active' THEN FALSE ELSE TRUE END AS archived,
+                    COALESCE(created_at, NOW()) AS created_at,
+                    NOW() AS updated_at
+                FROM public.alaris_characters
+                WHERE guild_id = %s
+                ON CONFLICT (guild_id, character_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    name = EXCLUDED.name,
+                    normalized_name = EXCLUDED.normalized_name,
+                    species = EXCLUDED.species,
+                    class_name = EXCLUDED.class_name,
+                    kingdom = EXCLUDED.kingdom,
+                    level = EXCLUDED.level,
+                    xp_total = EXCLUDED.xp_total,
+                    archived = EXCLUDED.archived,
+                    updated_at = NOW();
+                """,
+                (guild_id,),
+            )
+            synced = int(cur.rowcount or 0)
+        conn.commit()
+    return {
+        "has_alaris_characters": 1,
+        "alaris_found": alaris_found,
+        "synced": synced,
+        "missing_kingdom": missing_kingdom,
+    }
 
 
 def fetch_character_by_name_sync(guild_id: int, character_name: str) -> Optional[CharacterRef]:
@@ -803,6 +930,7 @@ async def econ_commands(interaction: discord.Interaction):
                 "• `/econ-set-kingdom-tax` - set a kingdom tax rate",
                 "• `/econ-set-kingdom-treasury` - set a kingdom treasury exactly",
                 "• `/econ-schema-status` - confirm economy schema/bootstrap status",
+                "• `/econ-sync-characters` - backfill the economy character mirror from Alaris",
             ]
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -1143,6 +1271,28 @@ async def econ_set_kingdom_treasury(interaction: discord.Interaction, kingdom: a
     await interaction.followup.send(f"Set **{clean_text(kingdom.value)}** treasury to **{format_currency(amount_embers)}**.", ephemeral=True)
 
 
+@tree.command(name="econ-sync-characters", description="Staff: sync existing Alaris characters into the economy lookup mirror.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+async def econ_sync_characters(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    result = await run_db(sync_public_characters_from_alaris_sync, int(interaction.guild_id or GUILD_ID))
+    await interaction.followup.send(
+        "\n".join(
+            [
+                f"**{APP_VERSION} Character Sync**",
+                f"Alaris character table present: **{bool(result['has_alaris_characters'])}**",
+                f"Active Alaris characters found: **{result['alaris_found']}**",
+                f"Compatibility rows inserted/updated: **{result['synced']}**",
+                f"Characters missing kingdom: **{result['missing_kingdom']}**",
+                "",
+                "This command is additive only. It does not delete characters, balances, assets, or transactions.",
+            ]
+        ),
+        ephemeral=True,
+    )
+
+
+
 @tree.command(name="econ-schema-status", description="Staff: check EconomyBot schema/bootstrap status.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 async def econ_schema_status(interaction: discord.Interaction):
@@ -1153,6 +1303,10 @@ async def econ_schema_status(interaction: discord.Interaction):
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) AS n FROM econ.kingdoms WHERE guild_id = %s;", (int(interaction.guild_id or GUILD_ID),))
                 kingdoms = int(cur.fetchone()["n"])
+                cur.execute("SELECT COUNT(*) AS n FROM public.characters WHERE guild_id = %s AND archived = FALSE;", (int(interaction.guild_id or GUILD_ID),))
+                compat_chars = int(cur.fetchone()["n"])
+                cur.execute("SELECT COUNT(*) AS n FROM public.alaris_characters WHERE guild_id = %s AND COALESCE(status, 'active') = 'active';", (int(interaction.guild_id or GUILD_ID),))
+                alaris_chars = int(cur.fetchone()["n"])
                 cur.execute("SELECT COUNT(*) AS n FROM econ.balances WHERE guild_id = %s;", (int(interaction.guild_id or GUILD_ID),))
                 balances = int(cur.fetchone()["n"])
                 cur.execute("SELECT COUNT(*) AS n FROM econ.assets WHERE guild_id = %s;", (int(interaction.guild_id or GUILD_ID),))
@@ -1172,7 +1326,7 @@ async def econ_schema_status(interaction: discord.Interaction):
                     """
                 )
                 flags = cur.fetchone()
-        return {"kingdoms": kingdoms, "balances": balances, "assets": assets, "queue": queue, **dict(flags)}
+        return {"kingdoms": kingdoms, "alaris_chars": alaris_chars, "compat_chars": compat_chars, "balances": balances, "assets": assets, "queue": queue, **dict(flags)}
 
     s = await run_db(status_sync)
     await interaction.followup.send(
@@ -1180,6 +1334,8 @@ async def econ_schema_status(interaction: discord.Interaction):
             [
                 f"**{APP_VERSION} Schema Status**",
                 f"Canonical kingdoms seeded: **{s['kingdoms']} / {len(CANON_KINGDOMS)}**",
+                f"Active Alaris characters: **{s['alaris_chars']}**",
+                f"Economy compatibility characters: **{s['compat_chars']}**",
                 f"Balance rows: **{s['balances']}**",
                 f"Asset rows: **{s['assets']}**",
                 f"Pending character refresh rows: **{s['queue']}**",
@@ -1211,6 +1367,8 @@ async def on_ready():
     try:
         await run_db(ensure_schema_sync)
         print("[startup] Economy schema ensured.")
+        sync_result = await run_db(sync_public_characters_from_alaris_sync, GUILD_ID)
+        print(f"[startup] Character sync result: {sync_result}")
     except Exception as exc:
         print(f"[startup][ERROR] ensure_schema failed: {exc}")
         traceback.print_exc()
@@ -1231,4 +1389,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
