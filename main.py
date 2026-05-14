@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v008"
+APP_VERSION = "Alaris_EconomyBot_v009"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -910,42 +910,40 @@ def total_asset_income_sync(guild_id: int, character_id: int) -> int:
 
 
 def set_character_kingdom_sync(guild_id: int, character_id: int, kingdom: str) -> None:
+    """Set a character kingdom in both the compatibility table and native Alaris table.
+
+    This intentionally avoids parameterized DO blocks. PostgreSQL can fail to infer
+    parameter types inside DO/PLPGSQL bodies, which caused the v008 crash on
+    /econ-set-character-kingdom. Direct UPDATE statements are safe here because
+    ensure_schema_sync() already creates/patches the needed columns and tables.
+    """
+    kingdom_text = str(kingdom or "").strip()
     with db_connect() as conn:
         with conn.cursor() as cur:
-            # Update compatibility/public table when present.
+            # Ensure the compatibility table has the column, then update it.
+            cur.execute("ALTER TABLE public.characters ADD COLUMN IF NOT EXISTS kingdom TEXT;")
             cur.execute(
                 """
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_schema = 'public' AND table_name = 'characters'
-                    ) THEN
-                        UPDATE public.characters
-                        SET kingdom = $3
-                        WHERE guild_id = $1 AND character_id = $2;
-                    END IF;
-                END $$;
-                """.replace("$1", "%s").replace("$2", "%s").replace("$3", "%s"),
-                (guild_id, character_id, kingdom),
+                UPDATE public.characters
+                SET kingdom = %s::text, updated_at = NOW()
+                WHERE guild_id = %s AND character_id = %s;
+                """,
+                (kingdom_text, guild_id, character_id),
             )
-            # Update native Alaris table when present.
-            cur.execute(
-                """
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_schema = 'public' AND table_name = 'alaris_characters'
-                    ) THEN
-                        UPDATE public.alaris_characters
-                        SET kingdom = $3
-                        WHERE guild_id = $1 AND id = $2;
-                    END IF;
-                END $$;
-                """.replace("$1", "%s").replace("$2", "%s").replace("$3", "%s"),
-                (guild_id, character_id, kingdom),
-            )
+
+            # If the native clean Alaris table exists, keep it in sync too.
+            cur.execute("SELECT to_regclass('public.alaris_characters') AS table_name;")
+            has_alaris = cur.fetchone()
+            if has_alaris and has_alaris.get("table_name"):
+                cur.execute("ALTER TABLE public.alaris_characters ADD COLUMN IF NOT EXISTS kingdom TEXT;")
+                cur.execute(
+                    """
+                    UPDATE public.alaris_characters
+                    SET kingdom = %s::text, updated_at = NOW()
+                    WHERE guild_id = %s AND id = %s;
+                    """,
+                    (kingdom_text, guild_id, character_id),
+                )
         conn.commit()
 
 
