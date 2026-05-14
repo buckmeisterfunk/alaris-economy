@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v002
+# Alaris_EconomyBot_v003
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot scaffold using shared Postgres.
-# v002: Adds safe character compatibility sync/backfill from alaris_characters.
+# v003: Adds player transfers, centralized transaction logging default, configurable daily income, and staff payout hook.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v002"
+APP_VERSION = "Alaris_EconomyBot_v003"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -45,7 +45,7 @@ CANON_KINGDOMS: list[str] = [
 ]
 
 DEFAULT_TAX_BP = 1000  # 10.00%
-DEFAULT_DAILY_INCOME_EMBERS = 100  # 1 Crown in base units; easy to tune later.
+DEFAULT_DAILY_INCOME_EMBERS = _get_int_env("DAILY_INCOME_EMBERS", 100) or 100  # 1 Crown default; tune via Railway env later.
 
 # Currency conversion, base unit = Ember.
 # 100 Embers = 1 Crown; 100 Crowns = 1 Sovereign; 100 Sovereigns = 1 Throne; 100 Thrones = 1 Astral.
@@ -96,7 +96,7 @@ DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
 DATABASE_URL = _get_env("DATABASE_URL")
 GUILD_ID = _get_int_env("GUILD_ID")
 STAFF_ROLE_IDS = _get_int_list_env("STAFF_ROLE_IDS")
-ECON_LOG_CHANNEL_ID = _get_int_env("ECON_LOG_CHANNEL_ID")
+ECON_LOG_CHANNEL_ID = _get_int_env("ECON_LOG_CHANNEL_ID", 1504528860237136022)
 BANK_CHANNEL_ID = _get_int_env("BANK_CHANNEL_ID")
 
 if not DISCORD_TOKEN:
@@ -199,7 +199,7 @@ async def run_db(fn, *args, **kwargs):
 
 
 def ensure_schema_sync() -> None:
-    """Additive-only schema setup for EconomyBot v002."""
+    """Additive-only schema setup for EconomyBot v003."""
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS econ;")
@@ -649,6 +649,95 @@ def adjust_balance_sync(guild_id: int, character_id: int, delta_embers: int) -> 
     return int(row["balance_embers"])
 
 
+def transfer_balance_sync(
+    guild_id: int,
+    source_character_id: int,
+    target_character_id: int,
+    amount_embers: int,
+) -> dict[str, int | bool | str]:
+    """Atomically transfer currency between two character balances.
+
+    Returns a dict with ok/source_balance/target_balance or ok=False and a reason.
+    Never allows the source balance to go negative.
+    """
+    amount = int(amount_embers or 0)
+    if amount <= 0:
+        return {"ok": False, "reason": "amount_must_be_positive"}
+    if int(source_character_id) == int(target_character_id):
+        return {"ok": False, "reason": "same_character"}
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            # Ensure both balance rows exist before locking.
+            cur.execute(
+                """
+                INSERT INTO econ.balances (guild_id, character_id, balance_embers, updated_at)
+                VALUES (%s, %s, 0, NOW())
+                ON CONFLICT (guild_id, character_id) DO NOTHING;
+                """,
+                (guild_id, source_character_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO econ.balances (guild_id, character_id, balance_embers, updated_at)
+                VALUES (%s, %s, 0, NOW())
+                ON CONFLICT (guild_id, character_id) DO NOTHING;
+                """,
+                (guild_id, target_character_id),
+            )
+
+            # Lock in a deterministic order to avoid deadlocks.
+            first_id, second_id = sorted([int(source_character_id), int(target_character_id)])
+            cur.execute(
+                """
+                SELECT character_id, balance_embers
+                FROM econ.balances
+                WHERE guild_id = %s AND character_id IN (%s, %s)
+                ORDER BY character_id
+                FOR UPDATE;
+                """,
+                (guild_id, first_id, second_id),
+            )
+            locked = {int(row["character_id"]): int(row["balance_embers"]) for row in cur.fetchall()}
+            source_balance = int(locked.get(int(source_character_id), 0))
+            target_balance = int(locked.get(int(target_character_id), 0))
+
+            if source_balance < amount:
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "reason": "insufficient_funds",
+                    "source_balance": source_balance,
+                    "target_balance": target_balance,
+                }
+
+            new_source = source_balance - amount
+            new_target = target_balance + amount
+            cur.execute(
+                """
+                UPDATE econ.balances
+                SET balance_embers = %s, updated_at = NOW()
+                WHERE guild_id = %s AND character_id = %s;
+                """,
+                (new_source, guild_id, source_character_id),
+            )
+            cur.execute(
+                """
+                UPDATE econ.balances
+                SET balance_embers = %s, updated_at = NOW()
+                WHERE guild_id = %s AND character_id = %s;
+                """,
+                (new_target, guild_id, target_character_id),
+            )
+        conn.commit()
+
+    return {
+        "ok": True,
+        "source_balance": new_source,
+        "target_balance": new_target,
+    }
+
+
 def log_transaction_sync(
     guild_id: int,
     character_id: Optional[int],
@@ -916,6 +1005,7 @@ async def econ_commands(interaction: discord.Interaction):
         "**Player**",
         "• `/balance` - view a character's economy card",
         "• `/income` - claim daily income for one of your characters",
+        "• `/econ-transfer` - transfer currency from one of your characters to another character",
         "• `/treasuries` - view kingdom treasury/tax status",
         "",
         "**Staff**" if staff else "**Staff commands hidden**",
@@ -925,6 +1015,7 @@ async def econ_commands(interaction: discord.Interaction):
             [
                 "• `/econ-set-balance` - set a character balance exactly",
                 "• `/econ-adjust` - adjust a character balance by an amount",
+                "• `/econ-payout` - staff payout for quests, combat, events, or corrections",
                 "• `/econ-grant-all` - grant all active characters currency",
                 "• `/econ-set-character-kingdom` - associate a character with a kingdom/land",
                 "• `/econ-set-kingdom-tax` - set a kingdom tax rate",
@@ -1162,6 +1253,138 @@ async def econ_adjust(interaction: discord.Interaction, character: str, delta_em
     await run_db(enqueue_character_refresh_sync, ref.guild_id, ref.character_id, "economy_adjust_balance")
     await log_to_channel("adjust_balance", [f"Character: **{clean_text(ref.name)}**", f"Delta: **{format_currency(delta_embers)}**", f"New balance: **{format_currency(new_balance)}**"])
     await interaction.followup.send(f"Adjusted **{clean_text(ref.name)}** by **{format_currency(delta_embers)}**. New balance: **{format_currency(new_balance)}**.", ephemeral=True)
+
+
+@tree.command(name="econ-transfer", description="Transfer currency from one of your characters to another character.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    source_character="One of your characters sending the currency",
+    target_character="The character receiving the currency",
+    amount_embers="Amount to transfer in Embers/base units",
+)
+@app_commands.autocomplete(source_character=character_autocomplete, target_character=character_autocomplete)
+async def econ_transfer(interaction: discord.Interaction, source_character: str, target_character: str, amount_embers: int):
+    await interaction.response.defer(ephemeral=True)
+    if amount_embers <= 0:
+        await interaction.followup.send("Transfer amount must be greater than 0 Embers.", ephemeral=True)
+        return
+
+    source_ref = await resolve_character_or_reply(interaction, source_character)
+    if not source_ref:
+        return
+    target_ref = await resolve_character_or_reply(interaction, target_character)
+    if not target_ref:
+        return
+
+    if int(source_ref.user_id) != int(interaction.user.id):
+        await interaction.followup.send("You may only transfer currency from a character you own.", ephemeral=True)
+        return
+    if int(source_ref.character_id) == int(target_ref.character_id):
+        await interaction.followup.send("Source and target character must be different.", ephemeral=True)
+        return
+
+    result = await run_db(
+        transfer_balance_sync,
+        source_ref.guild_id,
+        source_ref.character_id,
+        target_ref.character_id,
+        int(amount_embers),
+    )
+
+    if not result.get("ok"):
+        reason = result.get("reason")
+        if reason == "insufficient_funds":
+            await interaction.followup.send(
+                f"Insufficient funds. **{clean_text(source_ref.name)}** has **{format_currency(int(result.get('source_balance', 0)))}**.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send("Transfer could not be completed.", ephemeral=True)
+        return
+
+    details = {
+        "source_character_id": source_ref.character_id,
+        "source_character": source_ref.name,
+        "target_character_id": target_ref.character_id,
+        "target_character": target_ref.name,
+        "source_new_balance": int(result["source_balance"]),
+        "target_new_balance": int(result["target_balance"]),
+    }
+    await run_db(log_transaction_sync, source_ref.guild_id, source_ref.character_id, interaction.user.id, "transfer_out", -int(amount_embers), details)
+    await run_db(log_transaction_sync, target_ref.guild_id, target_ref.character_id, interaction.user.id, "transfer_in", int(amount_embers), details)
+    await run_db(enqueue_character_refresh_sync, source_ref.guild_id, source_ref.character_id, "economy_transfer_out")
+    await run_db(enqueue_character_refresh_sync, target_ref.guild_id, target_ref.character_id, "economy_transfer_in")
+
+    await log_to_channel(
+        "transfer",
+        [
+            f"From: **{clean_text(source_ref.name)}**",
+            f"To: **{clean_text(target_ref.name)}**",
+            f"Amount: **{format_currency(int(amount_embers))}**",
+            f"Performed by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
+            f"Source new balance: **{format_currency(int(result['source_balance']))}**",
+            f"Target new balance: **{format_currency(int(result['target_balance']))}**",
+        ],
+    )
+
+    await interaction.followup.send(
+        "\n".join(
+            [
+                f"Transferred **{format_currency(int(amount_embers))}** from **{clean_text(source_ref.name)}** to **{clean_text(target_ref.name)}**.",
+                f"{clean_text(source_ref.name)} balance: **{format_currency(int(result['source_balance']))}**",
+                f"{clean_text(target_ref.name)} balance: **{format_currency(int(result['target_balance']))}**",
+            ]
+        ),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="econ-payout", description="Staff: pay a character for quests, combat, events, or other rewards.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(
+    character="Character receiving the payout",
+    amount_embers="Payout amount in Embers/base units",
+    payout_type="Short payout category, such as combat, quest, event, or other",
+    reason="Brief reason for the payout",
+)
+@app_commands.autocomplete(character=character_autocomplete)
+async def econ_payout(interaction: discord.Interaction, character: str, amount_embers: int, payout_type: str = "other", reason: str = ""):
+    await interaction.response.defer(ephemeral=True)
+    if amount_embers <= 0:
+        await interaction.followup.send("Payout amount must be greater than 0 Embers.", ephemeral=True)
+        return
+    ref = await resolve_character_or_reply(interaction, character)
+    if not ref:
+        return
+
+    payout_type_clean = clean_text(payout_type or "other")[:40] or "other"
+    reason_clean = clean_text(reason or "")[:300]
+
+    new_balance = await run_db(adjust_balance_sync, ref.guild_id, ref.character_id, int(amount_embers))
+    await run_db(
+        log_transaction_sync,
+        ref.guild_id,
+        ref.character_id,
+        interaction.user.id,
+        f"payout_{payout_type_clean.lower().replace(' ', '_')}",
+        int(amount_embers),
+        {"character": ref.name, "payout_type": payout_type_clean, "reason": reason_clean},
+    )
+    await run_db(enqueue_character_refresh_sync, ref.guild_id, ref.character_id, "economy_payout")
+    await log_to_channel(
+        "payout",
+        [
+            f"Character: **{clean_text(ref.name)}**",
+            f"Type: **{payout_type_clean}**",
+            f"Amount: **{format_currency(int(amount_embers))}**",
+            f"Reason: {reason_clean or '—'}",
+            f"Performed by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
+            f"New balance: **{format_currency(new_balance)}**",
+        ],
+    )
+    await interaction.followup.send(
+        f"Paid **{format_currency(int(amount_embers))}** to **{clean_text(ref.name)}**. New balance: **{format_currency(new_balance)}**.",
+        ephemeral=True,
+    )
 
 
 @tree.command(name="econ-grant-all", description="Staff: grant currency to every active character.", guild=discord.Object(id=GUILD_ID))
