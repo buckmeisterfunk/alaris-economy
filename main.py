@@ -1,7 +1,7 @@
 # Alaris_EconomyBot_v001
 # Full replacement for main.py
 # Purpose: first standalone Alaris Economy Bot scaffold using shared Postgres.
-# Safety rules:
+# Safety rules
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
 # - Character economy is keyed by character_id, not character name.
