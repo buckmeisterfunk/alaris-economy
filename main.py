@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v007"
+APP_VERSION = "Alaris_EconomyBot_v008"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -1525,18 +1525,36 @@ TAX_CHOICES = [
 
 
 async def log_to_channel(action: str, lines: list[str]) -> None:
+    """Best-effort audit logging.
+
+    Economy commands must never fail only because the configured log channel is
+    missing, private to the bot, or temporarily unavailable. The database action
+    should still complete and the command should still return a useful response.
+    """
     if not ECON_LOG_CHANNEL_ID:
         return
-    channel = client.get_channel(int(ECON_LOG_CHANNEL_ID))
-    if channel is None:
-        try:
-            channel = await client.fetch_channel(int(ECON_LOG_CHANNEL_ID))
-        except Exception:
+    try:
+        channel = client.get_channel(int(ECON_LOG_CHANNEL_ID))
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(int(ECON_LOG_CHANNEL_ID))
+            except (discord.Forbidden, discord.NotFound) as exc:
+                print(f"[warn] Economy log channel unavailable ({ECON_LOG_CHANNEL_ID}): {exc}")
+                return
+            except Exception as exc:
+                print(f"[warn] Could not fetch economy log channel ({ECON_LOG_CHANNEL_ID}): {exc}")
+                return
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            print(f"[warn] Economy log target is not a text channel/thread: {ECON_LOG_CHANNEL_ID}")
             return
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return
-    text = f"**ECON LOG:** `{action}`\n" + "\n".join(lines)
-    await channel.send(text[:1900], allowed_mentions=discord.AllowedMentions.none())
+        text = f"**ECON LOG:** `{action}`\n" + "\n".join(lines)
+        await channel.send(text[:1900], allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden as exc:
+        print(f"[warn] Missing access/send permission for economy log channel {ECON_LOG_CHANNEL_ID}: {exc}")
+    except discord.HTTPException as exc:
+        print(f"[warn] Failed to send economy log message to {ECON_LOG_CHANNEL_ID}: {exc}")
+    except Exception as exc:
+        print(f"[warn] Unexpected economy log failure for {ECON_LOG_CHANNEL_ID}: {exc}")
 
 
 async def resolve_character_or_reply(interaction: discord.Interaction, character: str) -> Optional[CharacterRef]:
