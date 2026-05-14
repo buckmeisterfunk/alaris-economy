@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v003
+# Alaris_EconomyBot_v006
 # Full replacement for main.py
-# Purpose: standalone Alaris Economy Bot scaffold using shared Postgres.
-# v003: Adds player transfers, centralized transaction logging default, configurable daily income, and staff payout hook.
+# Purpose: standalone Alaris Economy Bot using shared Postgres.
+# v006: Verified ordering fix for DAILY_INCOME_EMBERS; env helpers are defined before config evaluation; keeps v005 behavior.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v004"
+APP_VERSION = "Alaris_EconomyBot_v006"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -45,8 +45,6 @@ CANON_KINGDOMS: list[str] = [
 ]
 
 DEFAULT_TAX_BP = 1000  # 10.00%
-DEFAULT_DAILY_INCOME_EMBERS = _get_int_env("DAILY_INCOME_EMBERS", 100) or 100  # 1 Crown default; tune via Railway env later.
-
 # Currency conversion, base unit = Ember.
 # 100 Embers = 1 Crown; 100 Crowns = 1 Sovereign; 100 Sovereigns = 1 Throne; 100 Thrones = 1 Astral.
 CURRENCY_UNITS: list[tuple[int, str, str]] = [
@@ -91,6 +89,8 @@ def _get_int_list_env(name: str) -> set[int]:
                 pass
     return out
 
+
+DEFAULT_DAILY_INCOME_EMBERS = _get_int_env("DAILY_INCOME_EMBERS", 100) or 100  # 1 Crown default; tune via Railway env later.
 
 DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
 DATABASE_URL = _get_env("DATABASE_URL")
