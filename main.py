@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v007
+# Alaris_EconomyBot_v010
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v007: Adds predefined asset catalog, /purchase-asset and /upgrade-asset player request flows, staff approval buttons, request persistence, balance re-check on approval, asset persistence, and character refresh queue hooks.
+# v010: Immediate safety fix. Disables economy-triggered character-card refresh queueing to prevent duplicate Alaris character showcase posts until AlarisBot has an edit-only refresh path.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v009"
+APP_VERSION = "Alaris_EconomyBot_v010"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -865,16 +865,15 @@ def log_transaction_sync(
 
 
 def enqueue_character_refresh_sync(guild_id: int, character_id: int, reason: str = "economy_update") -> None:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason)
-                VALUES (%s, %s, %s);
-                """,
-                (guild_id, character_id, reason),
-            )
-        conn.commit()
+    """
+    v010 safety guard: intentionally do NOT enqueue character-card refreshes.
+
+    The AlarisBot card refresh path can create a new showcase post when an
+    existing alaris_character_posts mapping is missing. Economy-triggered
+    refresh requests are therefore disabled until AlarisBot provides an
+    edit-only refresh worker that never creates new character posts.
+    """
+    return None
 
 
 def fetch_assets_sync(guild_id: int, character_id: int) -> list[dict[str, Any]]:
@@ -1419,13 +1418,9 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     json.dumps({"request_id": request_id, "asset_id": asset_id, "asset_type": req["asset_type"], "to_tier_code": req["to_tier_code"], "asset_name": req["asset_name"]}),
                 ),
             )
-            cur.execute(
-                """
-                INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason)
-                VALUES (%s, %s, %s);
-                """,
-                (guild_id, character_id, f"economy_asset_{req['request_type']}"),
-            )
+            # v010 safety: do not enqueue Alaris character-card refreshes here.
+            # Asset data is committed in econ.assets; AlarisBot will receive an
+            # edit-only refresh integration in a later version.
         conn.commit()
     return {"ok": True, "request": req, "asset_id": asset_id, "new_balance": new_balance}
 
@@ -2011,13 +2006,7 @@ async def econ_grant_all(interaction: discord.Interaction, amount_embers: int):
                         """,
                         (int(interaction.guild_id or GUILD_ID), cid, int(amount_embers)),
                     )
-                    cur.execute(
-                        """
-                        INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason)
-                        VALUES (%s, %s, 'economy_grant_all');
-                        """,
-                        (int(interaction.guild_id or GUILD_ID), cid),
-                    )
+                    # v010 safety: do not enqueue Alaris character-card refreshes here.
             conn.commit()
         return len(ids)
 
