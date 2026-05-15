@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v010"
+APP_VERSION = "Alaris_EconomyBot_v011"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -865,15 +865,21 @@ def log_transaction_sync(
 
 
 def enqueue_character_refresh_sync(guild_id: int, character_id: int, reason: str = "economy_update") -> None:
-    """
-    v010 safety guard: intentionally do NOT enqueue character-card refreshes.
+    """Queue an edit-only AlarisBot character-card refresh.
 
-    The AlarisBot card refresh path can create a new showcase post when an
-    existing alaris_character_posts mapping is missing. Economy-triggered
-    refresh requests are therefore disabled until AlarisBot provides an
-    edit-only refresh worker that never creates new character posts.
+    AlarisBot v105+ processes this queue safely: it edits mapped card messages
+    only and never creates a new showcase post for missing mappings.
     """
-    return None
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason, requested_at)
+                VALUES (%s, %s, %s, NOW());
+                """,
+                (int(guild_id), int(character_id), str(reason or "economy_update")),
+            )
+        conn.commit()
 
 
 def fetch_assets_sync(guild_id: int, character_id: int) -> list[dict[str, Any]]:
