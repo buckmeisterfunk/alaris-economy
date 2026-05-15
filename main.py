@@ -6,7 +6,7 @@
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
 # - Character economy is keyed by character_id, not character name.
-# - Uses canonical Alaris currency: Embers, Crowns, Sovereigns, Thrones, Astrals.
+# - Uses canonical Alaris currency: Copper Embers, Silver Crowns, Gold Sovereigns, Platinum Thrones, Star-metal Astrals.
 # - Uses canonical Alaris kingdoms/lands.
 
 from __future__ import annotations
@@ -212,7 +212,7 @@ def format_currency(amount_embers: int, *, show_base_total: bool = True) -> str:
 
     shown = sign + ", ".join(parts)
     if show_base_total:
-        shown += f" ({amount:,} Embers)"
+        shown += f" ({amount:,} Copper Embers)"
     return shown
 
 
