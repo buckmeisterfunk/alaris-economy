@@ -1065,6 +1065,44 @@ def fetch_owned_characters_sync(guild_id: int, user_id: int) -> list[dict[str, A
             return [dict(r) for r in cur.fetchall()]
 
 
+def character_is_owned_by_user_sync(guild_id: int, character_id: int, user_id: int) -> bool:
+    """Strict ownership check used for /income.
+
+    This intentionally does not grant a staff override. Daily income is a
+    player/character routine, not a staff reward tool. Staff payouts should use
+    /econ-payout instead.
+    """
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM public.characters
+                WHERE guild_id = %s
+                  AND character_id = %s
+                  AND user_id = %s
+                  AND archived = FALSE
+                LIMIT 1;
+                """,
+                (guild_id, character_id, user_id),
+            )
+            if cur.fetchone():
+                return True
+            cur.execute(
+                """
+                SELECT 1
+                FROM public.alaris_characters
+                WHERE guild_id = %s
+                  AND id = %s
+                  AND user_id = %s
+                  AND archived = FALSE
+                LIMIT 1;
+                """,
+                (guild_id, character_id, user_id),
+            )
+            return cur.fetchone() is not None
+
+
 def fetch_character_by_id_sync(guild_id: int, character_id: int) -> Optional[CharacterRef]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1509,6 +1547,25 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     return await run_db(search_characters_sync, int(guild_id), current or "")
 
 
+async def owned_character_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    guild_id = int(interaction.guild_id or GUILD_ID)
+    rows = await run_db(fetch_owned_characters_sync, guild_id, int(interaction.user.id))
+    needle = (current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = clean_text(row.get("name"))
+        if not name or name in seen:
+            continue
+        if needle and needle not in name.lower():
+            continue
+        seen.add(name)
+        choices.append(app_commands.Choice(name=name[:100], value=name[:100]))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 KINGDOM_CHOICES = [app_commands.Choice(name=k, value=k) for k in CANON_KINGDOMS]
 TAX_CHOICES = [
     app_commands.Choice(name="0%", value=0),
@@ -1667,14 +1724,23 @@ async def balance(interaction: discord.Interaction, character: str):
 
 @tree.command(name="income", description="Claim daily income for one of your characters.", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(character="Character name")
-@app_commands.autocomplete(character=character_autocomplete)
+@app_commands.autocomplete(character=owned_character_autocomplete)
 async def income(interaction: discord.Interaction, character: str):
     await interaction.response.defer(ephemeral=True)
     ref = await resolve_character_or_reply(interaction, character)
     if not ref:
         return
-    if int(ref.user_id) != int(interaction.user.id):
-        await interaction.followup.send("You may only claim income for a character you own.", ephemeral=True)
+    owns_character = await run_db(
+        character_is_owned_by_user_sync,
+        int(ref.guild_id),
+        int(ref.character_id),
+        int(interaction.user.id),
+    )
+    if not owns_character:
+        await interaction.followup.send(
+            "You may only claim daily income for a character you own. Staff rewards should use `/econ-payout`.",
+            ephemeral=True,
+        )
         return
     if not ref.kingdom:
         await interaction.followup.send("This character does not have a kingdom/land assigned yet. Ask staff to set it first.", ephemeral=True)
