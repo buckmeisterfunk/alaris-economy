@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v010
+# Alaris_EconomyBot_v015
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v010: Immediate safety fix. Disables economy-triggered character-card refresh queueing to prevent duplicate Alaris character showcase posts until AlarisBot has an edit-only refresh path.
+# v015: Removes weapon/armor purchasable assets from active asset catalog/dropdowns until equipment systems are built later.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v011"
+APP_VERSION = "Alaris_EconomyBot_v015"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -95,16 +95,6 @@ ASSET_DEFINITIONS_SEED: list[tuple[str, str, int, int]] = [
     ("Village", "(3) Village", 4800, 300),
     ("Village", "(4) Town", 9600, 400),
     ("Village", "(5) Small City", 15000, 500),
-    ("Weapons", "(1) Hit +1 / Dmg +1d4", 300, 0),
-    ("Weapons", "(2) Hit +1 / Dmg +1d6", 600, 0),
-    ("Weapons", "(3) Hit +2 / Dmg +1d8", 1200, 0),
-    ("Weapons", "(4) Hit +2 / Dmg +1d10", 2400, 0),
-    ("Weapons", "(5) Hit +2 / Dmg +1d12", 4800, 0),
-    ("Armor", "(1) AC +1", 300, 0),
-    ("Armor", "(2) AC +2", 600, 0),
-    ("Armor", "(3) AC +2 / Adv Magic Atk", 1200, 0),
-    ("Armor", "(4) AC +2 / Adv Magic and Melee Atk", 2400, 0),
-    ("Armor", "(5) AC +3 / Adv Magic and Melee Atk", 4800, 0),
 ]
 
 
@@ -505,6 +495,17 @@ def ensure_schema_sync() -> None:
                     """,
                     (asset_type, tier_code, tier_code, int(cost_embers), int(income_embers)),
                 )
+
+            # v015: Equipment systems are deferred. If earlier builds seeded these rows,
+            # keep the historical definitions but mark them inactive so they do not
+            # appear in purchase/upgrade dropdowns. This is additive/non-destructive.
+            cur.execute(
+                """
+                UPDATE econ.asset_definitions
+                SET is_active = FALSE, updated_at = NOW()
+                WHERE asset_type IN ('Weapons', 'Armor');
+                """
+            )
 
             for kingdom in CANON_KINGDOMS:
                 cur.execute(
@@ -1236,6 +1237,7 @@ def fetch_owned_assets_for_upgrade_sync(guild_id: int, character_id: int) -> lis
                 WHERE guild_id = %s
                   AND character_id = %s
                   AND asset_type <> 'Noble Title'
+                  AND asset_type NOT IN ('Weapons', 'Armor')
                 ORDER BY asset_type ASC, asset_name ASC;
                 """,
                 (guild_id, character_id),
