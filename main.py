@@ -1627,12 +1627,14 @@ async def resolve_character_or_reply(interaction: discord.Interaction, character
 # -----------------------------------------------------------------------------
 
 
-@tree.command(name="econ-ping", description="Check whether the Alaris Economy Bot is online.", guild=discord.Object(id=GUILD_ID))
+# Removed from slash sync in v014: testing utility no longer player-facing.
+# @tree.command(name="econ-ping", description="Check whether the Alaris Economy Bot is online.", guild=discord.Object(id=GUILD_ID))
 async def econ_ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"{APP_VERSION} is online.", ephemeral=True)
 
 
-@tree.command(name="econ-commands", description="Show Alaris Economy Bot commands.", guild=discord.Object(id=GUILD_ID))
+# Removed from slash sync in v014: command list no longer player-facing.
+# @tree.command(name="econ-commands", description="Show Alaris Economy Bot commands.", guild=discord.Object(id=GUILD_ID))
 async def econ_commands(interaction: discord.Interaction):
     staff = await is_staff(interaction)
     lines = [
@@ -1666,7 +1668,8 @@ async def econ_commands(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@tree.command(name="balance", description="View a character's Alaris economy balance.", guild=discord.Object(id=GUILD_ID))
+# Removed from slash sync in v014: balance appears in /character-view.
+# @tree.command(name="balance", description="View a character's Alaris economy balance.", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(character="Character name")
 @app_commands.autocomplete(character=character_autocomplete)
 async def balance(interaction: discord.Interaction, character: str):
@@ -1855,7 +1858,10 @@ async def income(interaction: discord.Interaction, character: str):
 
 
 @tree.command(name="treasuries", description="View Alaris kingdom treasury and tax status.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 async def treasuries(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
     await interaction.response.defer(ephemeral=True)
     rows = await run_db(fetch_kingdoms_sync, int(interaction.guild_id or GUILD_ID))
     embed = discord.Embed(title="Alaris Kingdom Treasuries", color=discord.Color.blurple())
@@ -1869,6 +1875,7 @@ async def treasuries(interaction: discord.Interaction):
 
 
 @tree.command(name="econ-set-balance", description="Staff: set a character balance exactly.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(character="Character name", amount_embers="Amount in Embers/base units")
 @app_commands.autocomplete(character=character_autocomplete)
@@ -1888,6 +1895,7 @@ async def econ_set_balance(interaction: discord.Interaction, character: str, amo
 
 
 @tree.command(name="econ-adjust", description="Staff: adjust a character balance by an amount.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(character="Character name", delta_embers="Positive or negative amount in Embers/base units")
 @app_commands.autocomplete(character=character_autocomplete)
@@ -1987,6 +1995,7 @@ async def econ_transfer(interaction: discord.Interaction, source_character: str,
 
 
 @tree.command(name="econ-payout", description="Staff: pay a character for quests, combat, events, or other rewards.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(
     character="Character receiving the payout",
@@ -2036,6 +2045,7 @@ async def econ_payout(interaction: discord.Interaction, character: str, amount_e
 
 
 @tree.command(name="econ-grant-all", description="Staff: grant currency to every active character.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(amount_embers="Amount in Embers/base units to grant to every active character")
 async def econ_grant_all(interaction: discord.Interaction, amount_embers: int):
@@ -2089,6 +2099,7 @@ async def econ_grant_all(interaction: discord.Interaction, amount_embers: int):
 
 
 @tree.command(name="econ-set-character-kingdom", description="Staff: associate a character with a kingdom/land.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(character="Character name", kingdom="Canonical Alaris kingdom/land")
 @app_commands.autocomplete(character=character_autocomplete)
@@ -2109,6 +2120,7 @@ async def econ_set_character_kingdom(interaction: discord.Interaction, character
 
 
 @tree.command(name="econ-set-kingdom-tax", description="Staff: set a kingdom tax rate.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(kingdom="Canonical Alaris kingdom/land", rate_percent="Tax rate")
 @app_commands.choices(kingdom=KINGDOM_CHOICES, rate_percent=TAX_CHOICES)
@@ -2122,6 +2134,7 @@ async def econ_set_kingdom_tax(interaction: discord.Interaction, kingdom: app_co
 
 
 @tree.command(name="econ-set-kingdom-treasury", description="Staff: set a kingdom treasury exactly.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.describe(kingdom="Canonical Alaris kingdom/land", amount_embers="Treasury amount in Embers/base units")
 @app_commands.choices(kingdom=KINGDOM_CHOICES)
@@ -2137,6 +2150,7 @@ async def econ_set_kingdom_treasury(interaction: discord.Interaction, kingdom: a
 
 
 @tree.command(name="econ-sync-characters", description="Staff: sync existing Alaris characters into the economy lookup mirror.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 async def econ_sync_characters(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -2159,6 +2173,7 @@ async def econ_sync_characters(interaction: discord.Interaction):
 
 
 @tree.command(name="econ-schema-status", description="Staff: check EconomyBot schema/bootstrap status.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 async def econ_schema_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -2660,6 +2675,7 @@ async def upgrade_asset(interaction: discord.Interaction):
 
 
 @tree.command(name="econ-asset-request-action", description="Staff fallback: approve or deny a pending asset request by ID.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.choices(action=[app_commands.Choice(name="Approve", value="approve"), app_commands.Choice(name="Deny", value="deny")])
 async def econ_asset_request_action(interaction: discord.Interaction, request_id: int, action: app_commands.Choice[str]):
