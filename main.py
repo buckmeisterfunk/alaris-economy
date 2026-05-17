@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v017
+# Alaris_EconomyBot_v020
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v017: Adds prestige-title tiers and keep/castle chain as purchasable staff-approved assets, with internal T1-T5 prestige gating.
+# v020: Full command-cleanup replacement based on v019. Keeps the locked player commands, removes redundant player clutter, and gates developer/debug tools to developer role 1505626082701738165 while preserving v019 economy, prestige assets, multi-character income, and approval flows.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,8 +31,9 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v017"
+APP_VERSION = "Alaris_EconomyBot_v020"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
+DEVELOPER_ROLE_ID = 1505626082701738165
 
 CANON_KINGDOMS: list[str] = [
     "Ephel Duath",
@@ -242,6 +243,23 @@ def format_currency(amount_embers: int, *, show_base_total: bool = True) -> str:
     if show_base_total:
         shown += f" ({amount:,} Copper Embers)"
     return shown
+
+
+def chunk_lines(lines: list[str], max_len: int = 1000) -> list[str]:
+    chunks: list[str] = []
+    cur = ""
+    for line in lines:
+        line = str(line or "—")
+        candidate = line if not cur else cur + "\n" + line
+        if len(candidate) > max_len:
+            if cur:
+                chunks.append(cur)
+            cur = line[:max_len]
+        else:
+            cur = candidate
+    if cur:
+        chunks.append(cur)
+    return chunks or ["—"]
 
 
 def bp_to_percent(bp: int) -> str:
@@ -1218,6 +1236,72 @@ def fetch_tiers_for_type_sync(asset_type: str) -> list[dict[str, Any]]:
     return rows
 
 
+
+
+def fetch_asset_catalog_sync() -> list[dict[str, Any]]:
+    """Return active asset catalog rows for staff review/status commands."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asset_type, tier_code, display_name, cost_embers, income_embers, is_active
+                FROM econ.asset_definitions
+                WHERE is_active = TRUE
+                ORDER BY asset_type ASC, tier_code ASC;
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    rows.sort(key=lambda r: (str(r.get("asset_type") or ""), tier_rank(r.get("tier_code")) or 999, str(r.get("tier_code") or "")))
+    return rows
+
+
+def fetch_pending_asset_requests_sync(guild_id: int) -> list[dict[str, Any]]:
+    """List pending asset requests with character names for staff review."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.*, COALESCE(c.name, ac.name, r.character_id::text) AS character_name
+                FROM econ.asset_requests r
+                LEFT JOIN public.characters c
+                  ON c.guild_id = r.guild_id AND c.character_id = r.character_id
+                LEFT JOIN public.alaris_characters ac
+                  ON ac.guild_id = r.guild_id AND ac.id = r.character_id
+                WHERE r.guild_id = %s
+                  AND r.status = 'pending'
+                ORDER BY r.requested_at ASC, r.id ASC
+                LIMIT 25;
+                """,
+                (guild_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def prestige_gate_notes_for_asset(asset_type: str, tier_code: str | None) -> list[str]:
+    """Human-readable prestige gate reminders used in catalog/request embeds."""
+    asset_type_clean = str(asset_type or "").strip()
+    rank = tier_rank(tier_code)
+    notes: list[str] = []
+    if asset_type_clean == "Village":
+        if rank == 1:
+            notes.append("Requires staff review. Sovereign lands need a land-leader approval scene; free lands need local-authority recognition.")
+            notes.append("Name is optional until Village status.")
+        elif rank == 4:
+            notes.append("Requires Prestige Tier 1+ before upgrading beyond Village into Town.")
+        elif rank == 5:
+            notes.append("Requires Prestige Tier 2+ for Small City.")
+    elif asset_type_clean == "Keep/Castle":
+        if rank == 1:
+            notes.append("Requires Prestige Tier 1+.")
+        elif rank == 3:
+            notes.append("Requires Prestige Tier 2+.")
+        elif rank and rank >= 4:
+            notes.append("Requires Prestige Tier 3+.")
+    elif asset_type_clean == "Noble Title":
+        notes.append("Prestige-only. No passive income. Staff approval determines displayed title/domain flavor.")
+        notes.append("Mechanics use internal Prestige Tier 1-5, not hardcoded noble names.")
+    return notes
+
 def fetch_asset_definition_sync(asset_type: str, tier_code: str) -> Optional[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1765,6 +1849,31 @@ async def require_staff(interaction: discord.Interaction) -> bool:
     return False
 
 
+def is_developer(interaction: discord.Interaction) -> bool:
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    return any(role.id == DEVELOPER_ROLE_ID for role in member.roles)
+
+
+def developer_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if is_developer(interaction):
+            return True
+        msg = "This command is restricted to the Alaris developer role."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        return False
+    return app_commands.check(predicate)
+
+
 async def character_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     guild_id = interaction.guild_id or GUILD_ID
     return await run_db(search_characters_sync, int(guild_id), current or "")
@@ -1948,141 +2057,252 @@ async def balance(interaction: discord.Interaction, character: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="income", description="Claim daily income for one of your characters.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(character="Character name")
-@app_commands.autocomplete(character=owned_character_autocomplete)
-async def income(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(ephemeral=True)
-    ref = await resolve_character_or_reply(interaction, character)
-    if not ref:
-        return
-    owns_character = await run_db(
-        character_is_owned_by_user_sync,
-        int(ref.guild_id),
-        int(ref.character_id),
-        int(interaction.user.id),
-    )
-    if not owns_character:
-        await interaction.followup.send(
-            "You may only claim daily income for a character you own. Staff rewards should use `/econ-payout`.",
-            ephemeral=True,
-        )
-        return
+
+
+def claim_income_for_ref_sync(ref: CharacterRef, actor_user_id: int, claim_date: date) -> dict[str, Any]:
+    """Claim daily income for one character. Ownership should be checked before calling."""
     if not ref.kingdom:
-        await interaction.followup.send("This character does not have a kingdom/land assigned yet. Ask staff to set it first.", ephemeral=True)
-        return
+        return {"ok": False, "reason": "missing_kingdom"}
 
-    today = datetime.now(CHICAGO_TZ).date()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT last_claim_date
+                FROM econ.income_claims
+                WHERE guild_id = %s AND character_id = %s
+                LIMIT 1;
+                """,
+                (ref.guild_id, ref.character_id),
+            )
+            row = cur.fetchone()
+            if row and row["last_claim_date"] == claim_date:
+                return {"ok": False, "reason": "already_claimed"}
 
-    def claim_sync() -> dict[str, Any]:
-        with db_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT last_claim_date
-                    FROM econ.income_claims
-                    WHERE guild_id = %s AND character_id = %s
-                    LIMIT 1;
-                    """,
-                    (ref.guild_id, ref.character_id),
-                )
-                row = cur.fetchone()
-                if row and row["last_claim_date"] == today:
-                    return {"ok": False, "reason": "already_claimed"}
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(income_embers), 0) AS asset_income
+                FROM econ.assets
+                WHERE guild_id = %s AND character_id = %s;
+                """,
+                (ref.guild_id, ref.character_id),
+            )
+            asset_income = int(cur.fetchone()["asset_income"] or 0)
+            base_income = daily_base_income_for_date(claim_date)
+            gross = base_income + asset_income
 
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(income_embers), 0) AS asset_income
-                    FROM econ.assets
-                    WHERE guild_id = %s AND character_id = %s;
-                    """,
-                    (ref.guild_id, ref.character_id),
-                )
-                asset_income = int(cur.fetchone()["asset_income"] or 0)
-                base_income = daily_base_income_for_date(today)
-                gross = base_income + asset_income
+            cur.execute(
+                "SELECT tax_rate_bp FROM econ.kingdoms WHERE guild_id = %s AND kingdom = %s LIMIT 1;",
+                (ref.guild_id, ref.kingdom),
+            )
+            tax_row = cur.fetchone()
+            tax_bp = int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP)
+            tax = calc_tax(gross, tax_bp)
+            net = max(0, gross - tax)
 
-                cur.execute(
-                    "SELECT tax_rate_bp FROM econ.kingdoms WHERE guild_id = %s AND kingdom = %s LIMIT 1;",
-                    (ref.guild_id, ref.kingdom),
-                )
-                tax_row = cur.fetchone()
-                tax_bp = int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP)
-                tax = calc_tax(gross, tax_bp)
-                net = max(0, gross - tax)
+            cur.execute(
+                """
+                INSERT INTO econ.balances (guild_id, character_id, balance_embers, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (guild_id, character_id)
+                DO UPDATE SET balance_embers = econ.balances.balance_embers + EXCLUDED.balance_embers,
+                              updated_at = NOW()
+                RETURNING balance_embers;
+                """,
+                (ref.guild_id, ref.character_id, net),
+            )
+            new_balance = int(cur.fetchone()["balance_embers"])
 
-                cur.execute(
-                    """
-                    INSERT INTO econ.balances (guild_id, character_id, balance_embers, updated_at)
-                    VALUES (%s, %s, %s, NOW())
-                    ON CONFLICT (guild_id, character_id)
-                    DO UPDATE SET balance_embers = econ.balances.balance_embers + EXCLUDED.balance_embers,
-                                  updated_at = NOW()
-                    RETURNING balance_embers;
-                    """,
-                    (ref.guild_id, ref.character_id, net),
-                )
-                new_balance = int(cur.fetchone()["balance_embers"])
+            cur.execute(
+                """
+                INSERT INTO econ.kingdoms (guild_id, kingdom, tax_rate_bp, treasury_embers, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, kingdom)
+                DO UPDATE SET treasury_embers = econ.kingdoms.treasury_embers + EXCLUDED.treasury_embers,
+                              updated_at = NOW();
+                """,
+                (ref.guild_id, ref.kingdom, DEFAULT_TAX_BP, tax),
+            )
 
-                cur.execute(
-                    """
-                    INSERT INTO econ.kingdoms (guild_id, kingdom, tax_rate_bp, treasury_embers, updated_at)
-                    VALUES (%s, %s, %s, %s, NOW())
-                    ON CONFLICT (guild_id, kingdom)
-                    DO UPDATE SET treasury_embers = econ.kingdoms.treasury_embers + EXCLUDED.treasury_embers,
-                                  updated_at = NOW();
-                    """,
-                    (ref.guild_id, ref.kingdom, DEFAULT_TAX_BP, tax),
-                )
+            cur.execute(
+                """
+                INSERT INTO econ.income_claims (guild_id, character_id, last_claim_date, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (guild_id, character_id)
+                DO UPDATE SET last_claim_date = EXCLUDED.last_claim_date, updated_at = NOW();
+                """,
+                (ref.guild_id, ref.character_id, claim_date),
+            )
+        conn.commit()
 
-                cur.execute(
-                    """
-                    INSERT INTO econ.income_claims (guild_id, character_id, last_claim_date, updated_at)
-                    VALUES (%s, %s, %s, NOW())
-                    ON CONFLICT (guild_id, character_id)
-                    DO UPDATE SET last_claim_date = EXCLUDED.last_claim_date, updated_at = NOW();
-                    """,
-                    (ref.guild_id, ref.character_id, today),
-                )
-            conn.commit()
-        log_transaction_sync(ref.guild_id, ref.character_id, interaction.user.id, "income_claim", net, {"gross": gross, "tax": tax, "tax_bp": tax_bp, "kingdom": ref.kingdom})
-        enqueue_character_refresh_sync(ref.guild_id, ref.character_id, "economy_income_claim")
-        return {"ok": True, "base": base_income, "asset_income": asset_income, "gross": gross, "tax": tax, "net": net, "new_balance": new_balance, "tax_bp": tax_bp}
-
-    result = await run_db(claim_sync)
-    if not result.get("ok"):
-        await interaction.followup.send("Daily income already claimed today.", ephemeral=True)
-        return
-
-    await log_to_channel(
+    log_transaction_sync(
+        ref.guild_id,
+        ref.character_id,
+        actor_user_id,
         "income_claim",
-        [
-            f"Character: **{clean_text(ref.name)}**",
-            f"Kingdom: **{clean_text(ref.kingdom)}**",
-            f"Gross: **{format_currency(result['gross'])}**",
-            f"Tax: **{format_currency(result['tax'])}** ({bp_to_percent(result['tax_bp'])})",
-            f"Net: **{format_currency(result['net'])}**",
-        ],
+        net,
+        {"gross": gross, "tax": tax, "tax_bp": tax_bp, "kingdom": ref.kingdom, "base": base_income, "asset_income": asset_income},
     )
+    enqueue_character_refresh_sync(ref.guild_id, ref.character_id, "economy_income_claim")
+    return {
+        "ok": True,
+        "character_name": ref.name,
+        "kingdom": ref.kingdom,
+        "base": base_income,
+        "asset_income": asset_income,
+        "gross": gross,
+        "tax": tax,
+        "net": net,
+        "new_balance": new_balance,
+        "tax_bp": tax_bp,
+    }
 
-    await interaction.followup.send(
-        "\n".join(
-            [
-                f"Claimed daily income for **{clean_text(ref.name)}**.",
-                f"Base income: **{format_currency(result['base'])}**",
-                f"Asset income: **{format_currency(result['asset_income'])}**",
-                f"Gross: **{format_currency(result['gross'])}**",
-                f"Tax to {clean_text(ref.kingdom)}: **{format_currency(result['tax'])}**",
-                f"Net received: **{format_currency(result['net'])}**",
-                f"New balance: **{format_currency(result['new_balance'])}**",
-            ]
-        ),
-        ephemeral=True,
-    )
+
+class IncomeCharacterSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(
+            placeholder="Choose characters to claim income for",
+            min_values=1,
+            max_values=max(1, min(len(options), 25)),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, IncomeClaimView):
+            view.selected_character_ids = [int(v) for v in self.values]
+            await view.update_panel(interaction, "Characters selected. Press **Claim Income** to process today's income.")
+
+
+class IncomeClaimView(discord.ui.View):
+    def __init__(self, owner_id: int, characters: list[dict[str, Any]]):
+        super().__init__(timeout=600)
+        self.owner_id = int(owner_id)
+        self.characters = characters[:25]
+        self.selected_character_ids: list[int] = []
+        self.rebuild_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("Only the player who opened this income claim may use it.", ephemeral=True)
+            return False
+        return True
+
+    def rebuild_items(self):
+        self.clear_items()
+        options: list[discord.SelectOption] = []
+        for c in self.characters:
+            cid = int(c["character_id"])
+            label = clean_text(c.get("name"))[:100] or f"Character {cid}"
+            desc = clean_text(c.get("kingdom"))[:100] or "No kingdom assigned"
+            options.append(discord.SelectOption(label=label, value=str(cid), description=desc, default=cid in self.selected_character_ids))
+        if options:
+            self.add_item(IncomeCharacterSelect(options))
+        button = discord.ui.Button(label="Claim Income", style=discord.ButtonStyle.success, disabled=not self.selected_character_ids)
+        async def claim_cb(interaction: discord.Interaction):
+            await self.claim_selected(interaction)
+        button.callback = claim_cb
+        self.add_item(button)
+
+    def build_embed(self, status: str = "") -> discord.Embed:
+        embed = discord.Embed(
+            title="Claim Daily Income",
+            color=discord.Color.gold(),
+            description="Select one or more owned characters, then press **Claim Income**. Each character can claim once per day.",
+        )
+        if status:
+            embed.add_field(name="Status", value=status[:1024], inline=False)
+        base_today = daily_base_income_for_date(datetime.now(CHICAGO_TZ).date())
+        embed.add_field(name="Today's Base Income", value=format_currency(base_today), inline=True)
+        embed.add_field(name="Selected", value=str(len(self.selected_character_ids)), inline=True)
+        return embed
+
+    async def update_panel(self, interaction: discord.Interaction, status: str = ""):
+        self.rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(status), view=self)
+
+    async def claim_selected(self, interaction: discord.Interaction):
+        if not self.selected_character_ids:
+            await interaction.response.send_message("Choose at least one character first.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild_id = int(interaction.guild_id or GUILD_ID)
+        today = datetime.now(CHICAGO_TZ).date()
+        successful: list[dict[str, Any]] = []
+        already: list[str] = []
+        missing_kingdom: list[str] = []
+        failed: list[str] = []
+
+        for cid in self.selected_character_ids:
+            owns = await run_db(character_is_owned_by_user_sync, guild_id, cid, int(interaction.user.id))
+            ref = await run_db(fetch_character_by_id_sync, guild_id, cid)
+            if not ref:
+                failed.append(f"Character `{cid}` was not found.")
+                continue
+            if not owns:
+                failed.append(f"{clean_text(ref.name)} was skipped because you do not own that character.")
+                continue
+            result = await run_db(claim_income_for_ref_sync, ref, int(interaction.user.id), today)
+            if result.get("ok"):
+                successful.append(result)
+                await log_to_channel(
+                    "income_claim",
+                    [
+                        f"Character: **{clean_text(ref.name)}**",
+                        f"Kingdom: **{clean_text(ref.kingdom)}**",
+                        f"Gross: **{format_currency(int(result['gross']))}**",
+                        f"Tax: **{format_currency(int(result['tax']))}** ({bp_to_percent(int(result['tax_bp']))})",
+                        f"Net: **{format_currency(int(result['net']))}**",
+                    ],
+                )
+            elif result.get("reason") == "already_claimed":
+                already.append(clean_text(ref.name))
+            elif result.get("reason") == "missing_kingdom":
+                missing_kingdom.append(clean_text(ref.name))
+            else:
+                failed.append(f"{clean_text(ref.name)} could not claim income.")
+
+        total_net = sum(int(r.get("net") or 0) for r in successful)
+        embed = discord.Embed(title="Daily Income Processed", color=discord.Color.gold())
+        if successful:
+            lines = []
+            for r in successful:
+                lines.append(
+                    f"• **{clean_text(r['character_name'])}** — Net **{format_currency(int(r['net']))}** "
+                    f"(Base {format_currency(int(r['base']), show_base_total=False)}, Assets {format_currency(int(r['asset_income']), show_base_total=False)}, Tax {format_currency(int(r['tax']), show_base_total=False)})"
+                )
+            embed.add_field(name="Claimed", value="\n".join(lines)[:1024], inline=False)
+        if already:
+            embed.add_field(name="Already Claimed Today", value="\n".join(f"• {n}" for n in already)[:1024], inline=False)
+        if missing_kingdom:
+            embed.add_field(name="Missing Kingdom/Land", value="\n".join(f"• {n}" for n in missing_kingdom)[:1024], inline=False)
+        if failed:
+            embed.add_field(name="Skipped", value="\n".join(f"• {n}" for n in failed)[:1024], inline=False)
+        embed.add_field(name="Total Net Earned", value=f"**{format_currency(total_net)}**", inline=False)
+
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.edit_original_response(embed=embed, view=self)
+        except Exception:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="income", description="Claim daily income for one or more of your characters.", guild=discord.Object(id=GUILD_ID))
+async def income(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild_id = int(interaction.guild_id or GUILD_ID)
+    characters = await run_db(fetch_owned_characters_sync, guild_id, int(interaction.user.id))
+    if not characters:
+        await interaction.followup.send("You do not have any active synced Alaris characters.", ephemeral=True)
+        return
+    view = IncomeClaimView(int(interaction.user.id), characters)
+    await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
 
 @tree.command(name="treasuries", description="View Alaris kingdom treasury and tax status.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
+@staff_only()
 async def treasuries(interaction: discord.Interaction):
     if not await require_staff(interaction):
         return
@@ -2373,9 +2593,9 @@ async def econ_set_kingdom_treasury(interaction: discord.Interaction, kingdom: a
     await interaction.followup.send(f"Set **{clean_text(kingdom.value)}** treasury to **{format_currency(amount_embers)}**.", ephemeral=True)
 
 
-@tree.command(name="econ-sync-characters", description="Staff: sync existing Alaris characters into the economy lookup mirror.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="econ-sync-characters", description="DEV: sync existing Alaris characters into the economy lookup mirror.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
-@staff_only()
+@developer_only()
 async def econ_sync_characters(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     result = await run_db(sync_public_characters_from_alaris_sync, int(interaction.guild_id or GUILD_ID))
@@ -2396,9 +2616,9 @@ async def econ_sync_characters(interaction: discord.Interaction):
 
 
 
-@tree.command(name="econ-schema-status", description="Staff: check EconomyBot schema/bootstrap status.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="econ-schema-status", description="DEV: check EconomyBot schema/bootstrap status.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
-@staff_only()
+@developer_only()
 async def econ_schema_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
@@ -2478,9 +2698,66 @@ def build_asset_request_embed(req: dict[str, Any], character_name: str | None = 
     embed.add_field(name="Cost", value=f"**{format_currency(int(req.get('cost_embers') or 0))}**", inline=True)
     income = int(req.get("income_embers") or 0)
     embed.add_field(name="Daily Income", value=format_currency(income, show_base_total=False), inline=True)
+    gate_notes = prestige_gate_notes_for_asset(str(req.get("asset_type") or ""), str(req.get("to_tier_code") or ""))
+    if gate_notes:
+        embed.add_field(name="Staff Review Notes", value="\n".join(f"• {clean_text(n)}" for n in gate_notes)[:1024], inline=False)
+    if req.get("decision_note"):
+        embed.add_field(name="Decision Note", value=clean_text(req.get("decision_note"))[:1024], inline=False)
     embed.set_footer(text="Staff should approve only after reviewing the request. Balance is re-checked at approval.")
     return embed
 
+
+
+class AssetDenyReasonModal(discord.ui.Modal, title="Deny Asset Request"):
+    reason = discord.ui.TextInput(
+        label="Reason for denial",
+        placeholder="Example: Awaiting sovereign approval scene / invalid asset location / duplicate request",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500,
+    )
+
+    def __init__(self, request_id: int):
+        super().__init__()
+        self.request_id = int(request_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await is_staff(interaction):
+            await interaction.response.send_message("Only staff may deny economy asset requests.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild_id = int(interaction.guild_id or GUILD_ID)
+        reason_text = clean_text(str(self.reason.value))[:500] or "Denied by staff."
+        result = await run_db(deny_asset_request_sync, guild_id, self.request_id, interaction.user.id, reason_text)
+        if not result.get("ok"):
+            await interaction.followup.send(f"Cannot deny request: `{clean_text(result.get('reason'))}`.", ephemeral=True)
+            return
+        req = result["request"]
+        ref = await run_db(fetch_character_by_id_sync, guild_id, int(req["character_id"]))
+        await log_to_channel(
+            "asset_request_denied",
+            [
+                f"Request ID: **{self.request_id}**",
+                f"Character: **{clean_text(ref.name if ref else req.get('character_id'))}**",
+                f"Asset: **{clean_text(req.get('asset_name'))}** — {clean_text(req.get('asset_type'))}",
+                f"Denied by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
+                f"Reason: {reason_text}",
+            ],
+        )
+        fresh = await run_db(fetch_asset_request_sync, guild_id, self.request_id)
+        # Best-effort edit of the original request message if stored.
+        try:
+            if fresh and fresh.get("request_channel_id") and fresh.get("request_message_id"):
+                channel = client.get_channel(int(fresh["request_channel_id"])) or await client.fetch_channel(int(fresh["request_channel_id"]))
+                if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    msg = await channel.fetch_message(int(fresh["request_message_id"]))
+                    disabled = AssetApprovalView(self.request_id)
+                    for child in disabled.children:
+                        child.disabled = True
+                    await msg.edit(embed=build_asset_request_embed(fresh, ref.name if ref else None), view=disabled)
+        except Exception as exc:
+            print(f"[warn] Could not edit denied asset request message {self.request_id}: {exc}")
+        await interaction.followup.send(f"Denied asset request #{self.request_id}: {reason_text}", ephemeral=True)
 
 class AssetApprovalView(discord.ui.View):
     def __init__(self, request_id: int):
@@ -2532,29 +2809,7 @@ class AssetApprovalView(discord.ui.View):
         if not await is_staff(interaction):
             await interaction.response.send_message("Only staff may deny economy asset requests.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        guild_id = int(interaction.guild_id or GUILD_ID)
-        result = await run_db(deny_asset_request_sync, guild_id, self.request_id, interaction.user.id, "Denied by staff button")
-        if not result.get("ok"):
-            await interaction.followup.send(f"Cannot deny request: `{clean_text(result.get('reason'))}`.", ephemeral=True)
-            return
-        req = result["request"]
-        ref = await run_db(fetch_character_by_id_sync, guild_id, int(req["character_id"]))
-        await log_to_channel(
-            "asset_request_denied",
-            [
-                f"Request ID: **{self.request_id}**",
-                f"Character: **{clean_text(ref.name if ref else req.get('character_id'))}**",
-                f"Asset: **{clean_text(req['asset_name'])}** — {clean_text(req['asset_type'])}",
-                f"Denied by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
-            ],
-        )
-        fresh = await run_db(fetch_asset_request_sync, guild_id, self.request_id)
-        if fresh and interaction.message:
-            for child in self.children:
-                child.disabled = True
-            await interaction.message.edit(embed=build_asset_request_embed(fresh, ref.name if ref else None), view=self)
-        await interaction.followup.send(f"Denied asset request #{self.request_id}.", ephemeral=True)
+        await interaction.response.send_modal(AssetDenyReasonModal(self.request_id))
 
 
 async def post_asset_request_to_staff_channel(guild_id: int, request_id: int, character_name: str):
@@ -2925,28 +3180,90 @@ async def upgrade_asset(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
+
+@tree.command(name="econ-asset-catalog", description="Staff: view active asset tiers, costs, income, and prestige gate notes.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+async def econ_asset_catalog(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = await run_db(fetch_asset_catalog_sync)
+    if not rows:
+        await interaction.followup.send("No active asset definitions found.", ephemeral=True)
+        return
+    embed = discord.Embed(title="Alaris Economy Asset Catalog", color=discord.Color.gold())
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        asset_type = clean_text(row.get("asset_type")) or "Other"
+        tier_code = clean_text(row.get("tier_code"))
+        cost = format_currency(int(row.get("cost_embers") or 0), show_base_total=False)
+        income = int(row.get("income_embers") or 0)
+        line = f"• **{tier_code}** — {cost}"
+        if income:
+            line += f" | +{format_currency(income, show_base_total=False)}/day"
+        notes = prestige_gate_notes_for_asset(asset_type, tier_code)
+        if notes:
+            line += f" | _{clean_text(notes[0])}_"
+        grouped.setdefault(asset_type, []).append(line)
+    for asset_type, lines in grouped.items():
+        for idx, chunk in enumerate(chunk_lines(lines, max_len=1000), start=1):
+            embed.add_field(name=asset_type if idx == 1 else f"{asset_type} ({idx})", value=chunk, inline=False)
+    embed.set_footer(text="Prestige gates are staff-reviewed. Asset definitions are additive-only and safe to review here.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="econ-pending-asset-requests", description="Staff: list pending economy asset requests awaiting review.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+async def econ_pending_asset_requests(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = await run_db(fetch_pending_asset_requests_sync, int(interaction.guild_id or GUILD_ID))
+    if not rows:
+        await interaction.followup.send("No pending asset requests.", ephemeral=True)
+        return
+    embed = discord.Embed(title="Pending Economy Asset Requests", color=discord.Color.blurple())
+    lines: list[str] = []
+    for r in rows:
+        req_id = int(r.get("id") or 0)
+        character_name = clean_text(r.get("character_name"))
+        asset_type = clean_text(r.get("asset_type"))
+        asset_name = clean_text(r.get("asset_name"))
+        tier = clean_text(r.get("to_tier_code"))
+        cost = format_currency(int(r.get("cost_embers") or 0), show_base_total=False)
+        lines.append(f"• `#{req_id}` **{character_name}** — {asset_name} | {asset_type} {tier} | {cost}")
+    for idx, chunk in enumerate(chunk_lines(lines, max_len=1000), start=1):
+        embed.add_field(name="Requests" if idx == 1 else f"Requests ({idx})", value=chunk, inline=False)
+    embed.set_footer(text="Use /econ-asset-request-action to approve/deny by ID. Denials should include a reason.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 @tree.command(name="econ-asset-request-action", description="Staff fallback: approve or deny a pending asset request by ID.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.choices(action=[app_commands.Choice(name="Approve", value="approve"), app_commands.Choice(name="Deny", value="deny")])
-async def econ_asset_request_action(interaction: discord.Interaction, request_id: int, action: app_commands.Choice[str]):
+@app_commands.describe(reason="Required when denying; optional audit note when approving")
+async def econ_asset_request_action(interaction: discord.Interaction, request_id: int, action: app_commands.Choice[str], reason: str = ""):
     await interaction.response.defer(ephemeral=True)
     guild_id = int(interaction.guild_id or GUILD_ID)
+    reason_clean = clean_text(reason or "")[:500]
     if action.value == "approve":
         result = await run_db(approve_asset_request_sync, guild_id, int(request_id), interaction.user.id)
     else:
-        result = await run_db(deny_asset_request_sync, guild_id, int(request_id), interaction.user.id, "Denied by fallback command")
+        if not reason_clean:
+            await interaction.followup.send("Please include a denial reason so the request has a useful audit trail.", ephemeral=True)
+            return
+        result = await run_db(deny_asset_request_sync, guild_id, int(request_id), interaction.user.id, reason_clean)
     if not result.get("ok"):
         await interaction.followup.send(f"Could not apply action: `{clean_text(result.get('reason'))}`.", ephemeral=True)
         return
-    await interaction.followup.send(f"Request #{request_id} marked `{action.value}`.", ephemeral=True)
+    if action.value == "deny":
+        await log_to_channel("asset_request_denied", [f"Request ID: **{request_id}**", f"Denied by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)", f"Reason: {reason_clean}"])
+    await interaction.followup.send(f"Request #{request_id} marked `{action.value}`." + (f" Reason: {reason_clean}" if reason_clean and action.value == "deny" else ""), ephemeral=True)
 
 
 
 
-@tree.command(name="econ-admin-wipe-test-data", description="Staff: wipe economy test data only. Does not delete characters or kingdoms.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="econ-admin-wipe-test-data", description="DEV: wipe economy test data only. Does not delete characters or kingdoms.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
-@staff_only()
+@developer_only()
 @app_commands.describe(confirmation="Type exactly: CONFIRM ECON WIPE")
 async def econ_admin_wipe_test_data(interaction: discord.Interaction, confirmation: str):
     await interaction.response.defer(ephemeral=True)
