@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v015"
+APP_VERSION = "Alaris_EconomyBot_v016"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -132,7 +132,10 @@ def _get_int_list_env(name: str) -> set[int]:
     return out
 
 
-DEFAULT_DAILY_INCOME_EMBERS = _get_int_env("DAILY_INCOME_EMBERS", 100) or 100  # 1 Crown default; tune via Railway env later.
+# Daily income defaults: slow weekday progress, slightly boosted weekend activity.
+# Override with Railway env vars if needed.
+DEFAULT_DAILY_INCOME_WEEKDAY_EMBERS = _get_int_env("DAILY_INCOME_WEEKDAY_EMBERS", 20) or 20
+DEFAULT_DAILY_INCOME_WEEKEND_EMBERS = _get_int_env("DAILY_INCOME_WEEKEND_EMBERS", 40) or 40
 
 DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
 DATABASE_URL = _get_env("DATABASE_URL")
@@ -221,6 +224,13 @@ def calc_tax(amount_embers: int, tax_bp: int) -> int:
     amount = max(0, int(amount_embers or 0))
     bp = max(0, int(tax_bp or 0))
     return (amount * bp) // 10000
+
+
+def daily_base_income_for_date(claim_date: date) -> int:
+    # Monday=0 ... Sunday=6. Friday/Saturday/Sunday receive the weekend rate.
+    if claim_date.weekday() in {4, 5, 6}:
+        return int(DEFAULT_DAILY_INCOME_WEEKEND_EMBERS)
+    return int(DEFAULT_DAILY_INCOME_WEEKDAY_EMBERS)
 
 
 def is_valid_kingdom(kingdom: str) -> bool:
@@ -1510,6 +1520,65 @@ def deny_asset_request_sync(guild_id: int, request_id: int, staff_user_id: int, 
     return {"ok": True, "request": req}
 
 
+
+
+def wipe_economy_test_data_sync(guild_id: int, actor_user_id: int) -> dict[str, int]:
+    """Guarded test-data wipe for the economy subsystem.
+
+    This intentionally preserves:
+    - public.characters / public.alaris_characters
+    - econ.kingdoms rows, tax rates, and treasury rows
+    - econ.asset_definitions catalog
+    - character kingdom assignments
+
+    It removes mutable player economy state for testing resets.
+    """
+    counts: dict[str, int] = {}
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            # Queue every active character for card refresh after economy state is cleared.
+            cur.execute(
+                """
+                SELECT character_id
+                FROM public.characters
+                WHERE guild_id = %s AND archived = FALSE;
+                """,
+                (guild_id,),
+            )
+            character_ids = [int(row["character_id"]) for row in cur.fetchall()]
+
+            tables = [
+                ("econ.bank_messages", "bank_messages"),
+                ("econ.income_claims", "income_claims"),
+                ("econ.asset_requests", "asset_requests"),
+                ("econ.assets", "assets"),
+                ("econ.balances", "balances"),
+                ("econ.transactions", "transactions"),
+            ]
+            for table_name, label in tables:
+                cur.execute(f"DELETE FROM {table_name} WHERE guild_id = %s;", (guild_id,))
+                counts[label] = int(cur.rowcount or 0)
+
+            for cid in character_ids:
+                cur.execute(
+                    """
+                    INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason, requested_at)
+                    VALUES (%s, %s, 'economy_test_wipe', NOW());
+                    """,
+                    (guild_id, cid),
+                )
+            counts["refresh_queued"] = len(character_ids)
+
+            cur.execute(
+                """
+                INSERT INTO econ.transactions (guild_id, character_id, actor_user_id, action, amount_embers, details_json)
+                VALUES (%s, NULL, %s, 'admin_wipe_test_data', 0, %s::jsonb);
+                """,
+                (guild_id, actor_user_id, json.dumps(counts)),
+            )
+        conn.commit()
+    return counts
+
 # -----------------------------------------------------------------------------
 # Discord helpers
 # -----------------------------------------------------------------------------
@@ -1542,6 +1611,20 @@ def staff_only():
         return False
 
     return app_commands.check(predicate)
+
+
+async def require_staff(interaction: discord.Interaction) -> bool:
+    if await is_staff(interaction):
+        return True
+    msg = "You do not have permission to use this Economy staff command."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+    return False
 
 
 async def character_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -1778,7 +1861,8 @@ async def income(interaction: discord.Interaction, character: str):
                     (ref.guild_id, ref.character_id),
                 )
                 asset_income = int(cur.fetchone()["asset_income"] or 0)
-                gross = DEFAULT_DAILY_INCOME_EMBERS + asset_income
+                base_income = daily_base_income_for_date(today)
+                gross = base_income + asset_income
 
                 cur.execute(
                     "SELECT tax_rate_bp FROM econ.kingdoms WHERE guild_id = %s AND kingdom = %s LIMIT 1;",
@@ -1825,7 +1909,7 @@ async def income(interaction: discord.Interaction, character: str):
             conn.commit()
         log_transaction_sync(ref.guild_id, ref.character_id, interaction.user.id, "income_claim", net, {"gross": gross, "tax": tax, "tax_bp": tax_bp, "kingdom": ref.kingdom})
         enqueue_character_refresh_sync(ref.guild_id, ref.character_id, "economy_income_claim")
-        return {"ok": True, "base": DEFAULT_DAILY_INCOME_EMBERS, "asset_income": asset_income, "gross": gross, "tax": tax, "net": net, "new_balance": new_balance, "tax_bp": tax_bp}
+        return {"ok": True, "base": base_income, "asset_income": asset_income, "gross": gross, "tax": tax, "net": net, "new_balance": new_balance, "tax_bp": tax_bp}
 
     result = await run_db(claim_sync)
     if not result.get("ok"):
@@ -2692,6 +2776,47 @@ async def econ_asset_request_action(interaction: discord.Interaction, request_id
         return
     await interaction.followup.send(f"Request #{request_id} marked `{action.value}`.", ephemeral=True)
 
+
+
+
+@tree.command(name="econ-admin-wipe-test-data", description="Staff: wipe economy test data only. Does not delete characters or kingdoms.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+@app_commands.describe(confirmation="Type exactly: CONFIRM ECON WIPE")
+async def econ_admin_wipe_test_data(interaction: discord.Interaction, confirmation: str):
+    await interaction.response.defer(ephemeral=True)
+    if confirmation.strip() != "CONFIRM ECON WIPE":
+        await interaction.followup.send("Wipe cancelled. Confirmation must be exactly `CONFIRM ECON WIPE`.", ephemeral=True)
+        return
+
+    counts = await run_db(wipe_economy_test_data_sync, int(interaction.guild_id or GUILD_ID), int(interaction.user.id))
+    await log_to_channel(
+        "admin_wipe_test_data",
+        [
+            f"Performed by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
+            f"Balances removed: **{counts.get('balances', 0):,}**",
+            f"Assets removed: **{counts.get('assets', 0):,}**",
+            f"Asset requests removed: **{counts.get('asset_requests', 0):,}**",
+            f"Income claims removed: **{counts.get('income_claims', 0):,}**",
+            f"Transactions removed before wipe marker: **{counts.get('transactions', 0):,}**",
+            f"Character card refreshes queued: **{counts.get('refresh_queued', 0):,}**",
+            "Preserved: characters, kingdoms, taxes, treasuries, kingdom assignments, and asset definitions.",
+        ],
+    )
+    await interaction.followup.send(
+        "\n".join(
+            [
+                "Economy test data wiped safely.",
+                f"Balances removed: **{counts.get('balances', 0):,}**",
+                f"Assets removed: **{counts.get('assets', 0):,}**",
+                f"Asset requests removed: **{counts.get('asset_requests', 0):,}**",
+                f"Income claims removed: **{counts.get('income_claims', 0):,}**",
+                f"Character card refreshes queued: **{counts.get('refresh_queued', 0):,}**",
+                "Preserved characters, kingdoms, taxes, treasuries, kingdom assignments, and asset definitions.",
+            ]
+        ),
+        ephemeral=True,
+    )
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
