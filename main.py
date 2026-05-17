@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v015
+# Alaris_EconomyBot_v017
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v015: Removes weapon/armor purchasable assets from active asset catalog/dropdowns until equipment systems are built later.
+# v017: Adds prestige-title tiers and keep/castle chain as purchasable staff-approved assets, with internal T1-T5 prestige gating.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v016"
+APP_VERSION = "Alaris_EconomyBot_v017"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 CANON_KINGDOMS: list[str] = [
@@ -58,7 +58,8 @@ CURRENCY_UNITS: list[tuple[int, str, str]] = [
 
 # Predefined asset catalog recovered from the prior economy bot.
 # Values are stored in Embers. Tier labels intentionally retain their in-world tier names.
-# Noble titles are intentionally omitted from player purchase/upgrade flows for now.
+# Prestige titles and keep/castle holdings are included as staff-approved prestige assets.
+# Noble-title mechanics use internal T1-T5 prestige tiers; displayed title names are flavor/rendering only.
 ASSET_DEFINITIONS_SEED: list[tuple[str, str, int, int]] = [
     ("Guild Trade Workshop", "(1) Guild Apprentice", 300, 50),
     ("Guild Trade Workshop", "(2) Guild Journeyman", 600, 100),
@@ -95,7 +96,41 @@ ASSET_DEFINITIONS_SEED: list[tuple[str, str, int, int]] = [
     ("Village", "(3) Village", 4800, 300),
     ("Village", "(4) Town", 9600, 400),
     ("Village", "(5) Small City", 15000, 500),
+    # Prestige Title costs are tier costs in Embers. These do not grant passive income.
+    ("Noble Title", "(1) Prestige Tier 1", 4000, 0),
+    ("Noble Title", "(2) Prestige Tier 2", 6000, 0),
+    ("Noble Title", "(3) Prestige Tier 3", 9000, 0),
+    ("Noble Title", "(4) Prestige Tier 4", 13000, 0),
+    ("Noble Title", "(5) Prestige Tier 5", 20000, 0),
+    # Keep/castle prestige chain. These are prestige holdings, not income engines.
+    ("Keep/Castle", "(1) Noble's Manor House", 2500, 0),
+    ("Keep/Castle", "(2) Wood-Palisaded Manor House", 6000, 0),
+    ("Keep/Castle", "(3) Motte & Bailey", 12000, 0),
+    ("Keep/Castle", "(4) Stone Keep", 24000, 0),
+    ("Keep/Castle", "(5) Walled Stone Keep", 40000, 0),
 ]
+
+TITLE_STYLE_BY_KINGDOM: dict[str, str] = {
+    "Ephel Duath": "sovereign",
+    "Galadon": "sovereign",
+    "Mullaghmore": "sovereign",
+    "Chiron": "sovereign",
+    "Vornladuhr": "vornladuhr",
+    "Frerinn": "frerinn",
+    "Vidalia": "vidalia",
+    "Idolea": "idolea",
+}
+
+TITLE_FLAVOR_BY_STYLE: dict[str, dict[int, str]] = {
+    "sovereign": {1: "Baron/Baroness", 2: "Viscount/Viscountess", 3: "Earl/Countess", 4: "Marquess/Marchioness", 5: "Duke/Duchess"},
+    "vornladuhr": {1: "Holdmaster", 2: "High Holdmaster", 3: "Deepthane", 4: "Stone Marshal", 5: "High Thane"},
+    "frerinn": {1: "Skaldthane", 2: "Sea Jarl", 3: "High Jarl", 4: "Frost Marshal", 5: "Great Jarl"},
+    "vidalia": {1: "Chartermaster", 2: "High Chartermaster", 3: "Riverlord", 4: "Trade Prince", 5: "Grand Charterlord"},
+    "idolea": {1: "Tidewarden", 2: "Reeflord", 3: "Island Marshal", 4: "High Navigator", 5: "Stormlord"},
+}
+
+FREE_LANDS: set[str] = {"Vornladuhr", "Frerinn", "Vidalia", "Idolea"}
+
 
 
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -489,6 +524,14 @@ def ensure_schema_sync() -> None:
             cur.execute("ALTER TABLE econ.asset_definitions ADD COLUMN IF NOT EXISTS income_embers BIGINT NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE econ.asset_definitions ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
             cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS asset_id BIGINT;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS prestige_tier INTEGER;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS title_style TEXT;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS display_title TEXT;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS domain_name TEXT;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS prestige_tier INTEGER;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS title_style TEXT;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS display_title TEXT;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS domain_name TEXT;")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS asset_definitions_asset_type_tier_code_uidx ON econ.asset_definitions (asset_type, tier_code);")
 
             for asset_type, tier_code, cost_embers, income_embers in ASSET_DEFINITIONS_SEED:
@@ -1151,7 +1194,7 @@ def fetch_asset_types_sync() -> list[str]:
                 """
                 SELECT DISTINCT asset_type
                 FROM econ.asset_definitions
-                WHERE is_active = TRUE AND asset_type <> 'Noble Title'
+                WHERE is_active = TRUE AND asset_type NOT IN ('Weapons', 'Armor')
                 ORDER BY asset_type ASC;
                 """
             )
@@ -1237,16 +1280,102 @@ def incremental_cost_between_tiers_sync(asset_type: str, current_tier_code: str,
     return max(0, int(c_target) - int(c_current))
 
 
+
+def title_style_for_kingdom(kingdom: Optional[str]) -> str:
+    return TITLE_STYLE_BY_KINGDOM.get(str(kingdom or "").strip(), "sovereign")
+
+
+def title_flavor_for(style: str, prestige_tier: int) -> str:
+    return TITLE_FLAVOR_BY_STYLE.get(style, TITLE_FLAVOR_BY_STYLE["sovereign"]).get(int(prestige_tier), f"Prestige Tier {prestige_tier}")
+
+
+def render_title_display(kingdom: Optional[str], prestige_tier: int, domain_name: Optional[str]) -> str:
+    style = title_style_for_kingdom(kingdom)
+    title = title_flavor_for(style, int(prestige_tier))
+    domain = clean_text(domain_name or "")
+    if domain:
+        return f"{title} of {domain}"
+    return title
+
+
+def prestige_tier_from_asset_type_tier(asset_type: str, tier_code: Optional[str]) -> Optional[int]:
+    if str(asset_type or "").strip() != "Noble Title":
+        return None
+    return tier_rank(tier_code) or None
+
+
+def max_prestige_tier_sync(guild_id: int, character_id: int) -> int:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(MAX(COALESCE(prestige_tier, NULL)), 0) AS explicit_max,
+                       COALESCE(MAX(NULLIF(regexp_replace(COALESCE(tier_code,''), '[^0-9]', '', 'g'), '')::integer), 0) AS tier_max
+                FROM econ.assets
+                WHERE guild_id = %s AND character_id = %s AND asset_type = 'Noble Title';
+                """,
+                (guild_id, character_id),
+            )
+            row = cur.fetchone() or {}
+            return max(int(row.get("explicit_max") or 0), int(row.get("tier_max") or 0))
+
+
+def count_settlement_assets_sync(guild_id: int, character_id: int) -> int:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM econ.assets
+                WHERE guild_id = %s AND character_id = %s AND asset_type = 'Village';
+                """,
+                (guild_id, character_id),
+            )
+            row = cur.fetchone() or {}
+            return int(row.get("n") or 0)
+
+
+def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], current_prestige: int, *, is_new_purchase: bool, guild_id: int, character_id: int) -> Optional[str]:
+    asset_type = str(asset_type or "").strip()
+    tier = tier_rank(target_tier_code) or 0
+
+    if asset_type == "Village":
+        # A character can hold one settlement chain freely. More settlement chains are gated by prestige.
+        if is_new_purchase:
+            count = count_settlement_assets_sync(guild_id, character_id)
+            if count >= 1:
+                if current_prestige < 3:
+                    return "Additional settlement chains require Prestige Tier 3."
+                if current_prestige < 5 and count >= 3:
+                    return "Prestige Tier 3-4 characters may hold no more than 3 settlement chains."
+                if current_prestige >= 5 and count >= 6:
+                    return "Prestige Tier 5 characters may hold no more than 6 settlement chains."
+        # Upgrading beyond Village/T3 requires prestige. Small City/T5 requires Prestige Tier 2.
+        if tier >= 5 and current_prestige < 2:
+            return "Small City requires Prestige Tier 2."
+        if tier >= 4 and current_prestige < 1:
+            return "Town and higher settlement upgrades require Prestige Tier 1."
+
+    if asset_type == "Keep/Castle":
+        if tier >= 4 and current_prestige < 3:
+            return "Stone Keep and Walled Stone Keep require Prestige Tier 3."
+        if tier >= 3 and current_prestige < 2:
+            return "Motte & Bailey requires Prestige Tier 2."
+        if tier >= 1 and current_prestige < 1:
+            return "Keep/Castle holdings require Prestige Tier 1."
+
+    return None
+
+
 def fetch_owned_assets_for_upgrade_sync(guild_id: int, character_id: int) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, asset_type, tier_code, asset_name, kingdom, income_embers
+                SELECT id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name
                 FROM econ.assets
                 WHERE guild_id = %s
                   AND character_id = %s
-                  AND asset_type <> 'Noble Title'
                   AND asset_type NOT IN ('Weapons', 'Armor')
                 ORDER BY asset_type ASC, asset_name ASC;
                 """,
@@ -1260,7 +1389,7 @@ def fetch_asset_by_id_sync(guild_id: int, asset_id: int) -> Optional[dict[str, A
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, guild_id, character_id, asset_type, tier_code, asset_name, kingdom, income_embers
+                SELECT id, guild_id, character_id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name
                 FROM econ.assets
                 WHERE guild_id = %s AND id = %s
                 LIMIT 1;
@@ -1284,6 +1413,10 @@ def create_asset_request_sync(
     income_embers: int,
     asset_id: Optional[int] = None,
     from_tier_code: Optional[str] = None,
+    prestige_tier: Optional[int] = None,
+    title_style: Optional[str] = None,
+    display_title: Optional[str] = None,
+    domain_name: Optional[str] = None,
 ) -> int:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1291,11 +1424,12 @@ def create_asset_request_sync(
                 """
                 INSERT INTO econ.asset_requests (
                     guild_id, request_type, status, character_id, user_id, asset_id, asset_type,
-                    from_tier_code, to_tier_code, asset_name, kingdom, cost_embers, income_embers
-                ) VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    from_tier_code, to_tier_code, asset_name, kingdom, cost_embers, income_embers,
+                    prestige_tier, title_style, display_title, domain_name
+                ) VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
-                (guild_id, request_type, character_id, user_id, asset_id, asset_type, from_tier_code, to_tier_code, asset_name, kingdom, int(cost_embers), int(income_embers)),
+                (guild_id, request_type, character_id, user_id, asset_id, asset_type, from_tier_code, to_tier_code, asset_name, kingdom, int(cost_embers), int(income_embers), prestige_tier, title_style, display_title, domain_name),
             )
             request_id = int(cur.fetchone()["id"])
         conn.commit()
@@ -1398,11 +1532,11 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     """
                     INSERT INTO econ.assets (
                         guild_id, character_id, asset_type, tier_code, asset_name, kingdom,
-                        income_embers, created_by_user_id, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        income_embers, created_by_user_id, prestige_tier, title_style, display_title, domain_name, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING id;
                     """,
-                    (guild_id, character_id, req["asset_type"], req["to_tier_code"], req["asset_name"], req.get("kingdom"), int(req.get("income_embers") or 0), staff_user_id),
+                    (guild_id, character_id, req["asset_type"], req["to_tier_code"], req["asset_name"], req.get("kingdom"), int(req.get("income_embers") or 0), staff_user_id, req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name")),
                 )
                 asset_id = int(cur.fetchone()["id"])
             elif req["request_type"] == "upgrade":
@@ -1434,10 +1568,14 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     SET tier_code = %s,
                         kingdom = COALESCE(NULLIF(kingdom, ''), %s),
                         income_embers = %s,
+                        prestige_tier = %s,
+                        title_style = %s,
+                        display_title = %s,
+                        domain_name = %s,
                         updated_at = NOW()
                     WHERE guild_id = %s AND id = %s;
                     """,
-                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), guild_id, asset_id),
+                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), guild_id, asset_id),
                 )
             else:
                 conn.rollback()
@@ -2334,6 +2472,8 @@ def build_asset_request_embed(req: dict[str, Any], character_name: str | None = 
     else:
         embed.add_field(name="Tier", value=clean_text(req.get("to_tier_code")), inline=True)
     embed.add_field(name="Asset Name", value=clean_text(req.get("asset_name")), inline=False)
+    if req.get("display_title"):
+        embed.add_field(name="Rendered Title", value=clean_text(req.get("display_title")), inline=False)
     embed.add_field(name="Kingdom/Land", value=clean_text(req.get("kingdom")) or "—", inline=True)
     embed.add_field(name="Cost", value=f"**{format_currency(int(req.get('cost_embers') or 0))}**", inline=True)
     income = int(req.get("income_embers") or 0)
@@ -2462,6 +2602,11 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
         if not asset_def:
             await interaction.followup.send("That asset tier is no longer available.", ephemeral=True)
             return
+        current_prestige = await run_db(max_prestige_tier_sync, guild_id, ref.character_id)
+        gate_msg = await run_db(prestige_gate_message_for, self.asset_type, self.tier_code, current_prestige, is_new_purchase=True, guild_id=guild_id, character_id=ref.character_id)
+        if gate_msg:
+            await interaction.followup.send(gate_msg, ephemeral=True)
+            return
         cost = await run_db(cumulative_cost_to_tier_sync, self.asset_type, self.tier_code)
         if cost is None or cost <= 0:
             await interaction.followup.send("Unable to calculate the purchase cost for that asset.", ephemeral=True)
@@ -2474,6 +2619,9 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
         if not clean_name:
             await interaction.followup.send("Asset name cannot be blank.", ephemeral=True)
             return
+        prestige_tier = prestige_tier_from_asset_type_tier(self.asset_type, self.tier_code)
+        title_style = title_style_for_kingdom(ref.kingdom) if self.asset_type == "Noble Title" else None
+        display_title = render_title_display(ref.kingdom, int(prestige_tier or 0), clean_name) if self.asset_type == "Noble Title" else None
         request_id = await run_db(
             create_asset_request_sync,
             guild_id,
@@ -2488,6 +2636,10 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
             int(asset_def.get("income_embers") or 0),
             None,
             None,
+            prestige_tier,
+            title_style,
+            display_title,
+            clean_name if self.asset_type == "Noble Title" else None,
         )
         await post_asset_request_to_staff_channel(guild_id, request_id, ref.name)
         await log_to_channel("asset_purchase_requested", [f"Request ID: **{request_id}**", f"Character: **{clean_text(ref.name)}**", f"Asset: **{clean_name}** — {self.asset_type}", f"Tier: **{self.tier_code}**", f"Cost: **{format_currency(int(cost))}**"])
@@ -2682,6 +2834,11 @@ class UpgradeAssetView(discord.ui.View):
         if not asset or int(asset["character_id"]) != int(ref.character_id):
             await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
             return
+        current_prestige = await run_db(max_prestige_tier_sync, guild_id, ref.character_id)
+        gate_msg = await run_db(prestige_gate_message_for, asset["asset_type"], self.target_tier, current_prestige, is_new_purchase=False, guild_id=guild_id, character_id=ref.character_id)
+        if gate_msg:
+            await interaction.followup.send(gate_msg, ephemeral=True)
+            return
         cost = await run_db(incremental_cost_between_tiers_sync, asset["asset_type"], asset["tier_code"], self.target_tier)
         if cost is None or cost <= 0:
             await interaction.followup.send("Unable to calculate the upgrade cost for that target tier.", ephemeral=True)
@@ -2694,6 +2851,10 @@ class UpgradeAssetView(discord.ui.View):
         if not target_def:
             await interaction.followup.send("That target tier is no longer available.", ephemeral=True)
             return
+        prestige_tier = prestige_tier_from_asset_type_tier(asset["asset_type"], self.target_tier)
+        title_kingdom = asset.get("kingdom") or ref.kingdom
+        title_style = title_style_for_kingdom(title_kingdom) if asset["asset_type"] == "Noble Title" else None
+        display_title = render_title_display(title_kingdom, int(prestige_tier or 0), asset.get("asset_name")) if asset["asset_type"] == "Noble Title" else None
         request_id = await run_db(
             create_asset_request_sync,
             guild_id,
@@ -2703,11 +2864,15 @@ class UpgradeAssetView(discord.ui.View):
             asset["asset_type"],
             self.target_tier,
             asset["asset_name"],
-            asset.get("kingdom") or ref.kingdom,
+            title_kingdom,
             int(cost),
             int(target_def.get("income_embers") or 0),
             int(asset["id"]),
             asset.get("tier_code"),
+            prestige_tier,
+            title_style,
+            display_title,
+            asset.get("asset_name") if asset["asset_type"] == "Noble Title" else None,
         )
         await post_asset_request_to_staff_channel(guild_id, request_id, ref.name)
         await log_to_channel("asset_upgrade_requested", [f"Request ID: **{request_id}**", f"Character: **{clean_text(ref.name)}**", f"Asset: **{clean_text(asset['asset_name'])}** — {clean_text(asset['asset_type'])}", f"From: **{clean_text(asset['tier_code'])}**", f"To: **{clean_text(self.target_tier)}**", f"Cost: **{format_currency(int(cost))}**"])
