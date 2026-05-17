@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v020
+# Alaris_EconomyBot_v021
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v020: Full command-cleanup replacement based on v019. Keeps the locked player commands, removes redundant player clutter, and gates developer/debug tools to developer role 1505626082701738165 while preserving v019 economy, prestige assets, multi-character income, and approval flows.
+# v021: Adds purchasable combat enchantments as expensive sequential upgrade chains: Warding +1-5 AC, Accuracy +1-5 attack rolls, Potency +1-5 damage. Preserves v020 command cleanup and all v019/v020 economy features.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v020"
+APP_VERSION = "Alaris_EconomyBot_v021"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -109,6 +109,23 @@ ASSET_DEFINITIONS_SEED: list[tuple[str, str, int, int]] = [
     ("Keep/Castle", "(3) Motte & Bailey", 12000, 0),
     ("Keep/Castle", "(4) Stone Keep", 24000, 0),
     ("Keep/Castle", "(5) Walled Stone Keep", 40000, 0),
+    # Combat enchantments. These are sequential upgrade chains and do not grant passive income.
+    # Warding applies to AC, Accuracy applies to attack rolls, Potency applies to damage.
+    ("Enchantment - Warding", "(1) Warding +1", 2000, 0),
+    ("Enchantment - Warding", "(2) Warding +2", 6000, 0),
+    ("Enchantment - Warding", "(3) Warding +3", 14000, 0),
+    ("Enchantment - Warding", "(4) Warding +4", 28000, 0),
+    ("Enchantment - Warding", "(5) Warding +5", 50000, 0),
+    ("Enchantment - Accuracy", "(1) Accuracy +1", 2000, 0),
+    ("Enchantment - Accuracy", "(2) Accuracy +2", 6000, 0),
+    ("Enchantment - Accuracy", "(3) Accuracy +3", 14000, 0),
+    ("Enchantment - Accuracy", "(4) Accuracy +4", 28000, 0),
+    ("Enchantment - Accuracy", "(5) Accuracy +5", 50000, 0),
+    ("Enchantment - Potency", "(1) Potency +1", 2000, 0),
+    ("Enchantment - Potency", "(2) Potency +2", 6000, 0),
+    ("Enchantment - Potency", "(3) Potency +3", 14000, 0),
+    ("Enchantment - Potency", "(4) Potency +4", 28000, 0),
+    ("Enchantment - Potency", "(5) Potency +5", 50000, 0),
 ]
 
 TITLE_STYLE_BY_KINGDOM: dict[str, str] = {
@@ -132,6 +149,31 @@ TITLE_FLAVOR_BY_STYLE: dict[str, dict[int, str]] = {
 
 FREE_LANDS: set[str] = {"Vornladuhr", "Frerinn", "Vidalia", "Idolea"}
 
+ENCHANTMENT_ASSET_TYPES: set[str] = {"Enchantment - Warding", "Enchantment - Accuracy", "Enchantment - Potency"}
+
+def is_enchantment_asset_type(asset_type: str | None) -> bool:
+    return str(asset_type or "").strip() in ENCHANTMENT_ASSET_TYPES
+
+def enchantment_effect_label(asset_type: str | None, tier_code: str | None) -> str:
+    rank = tier_rank(tier_code) or 0
+    at = str(asset_type or "").strip()
+    if at == "Enchantment - Warding":
+        return f"+{rank} AC" if rank else "AC bonus"
+    if at == "Enchantment - Accuracy":
+        return f"+{rank} to attack rolls" if rank else "attack roll bonus"
+    if at == "Enchantment - Potency":
+        return f"+{rank} damage" if rank else "damage bonus"
+    return ""
+
+def enchantment_bonus_type(asset_type: str | None) -> Optional[str]:
+    at = str(asset_type or "").strip()
+    if at == "Enchantment - Warding":
+        return "warding_ac"
+    if at == "Enchantment - Accuracy":
+        return "accuracy_attack"
+    if at == "Enchantment - Potency":
+        return "potency_damage"
+    return None
 
 
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -546,10 +588,16 @@ def ensure_schema_sync() -> None:
             cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS title_style TEXT;")
             cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS display_title TEXT;")
             cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS domain_name TEXT;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS combat_bonus_type TEXT;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS combat_bonus_value INTEGER;")
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS combat_bonus_scope TEXT;")
             cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS prestige_tier INTEGER;")
             cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS title_style TEXT;")
             cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS display_title TEXT;")
             cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS domain_name TEXT;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS combat_bonus_type TEXT;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS combat_bonus_value INTEGER;")
+            cur.execute("ALTER TABLE econ.asset_requests ADD COLUMN IF NOT EXISTS combat_bonus_scope TEXT;")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS asset_definitions_asset_type_tier_code_uidx ON econ.asset_definitions (asset_type, tier_code);")
 
             for asset_type, tier_code, cost_embers, income_embers in ASSET_DEFINITIONS_SEED:
@@ -1300,6 +1348,12 @@ def prestige_gate_notes_for_asset(asset_type: str, tier_code: str | None) -> lis
     elif asset_type_clean == "Noble Title":
         notes.append("Prestige-only. No passive income. Staff approval determines displayed title/domain flavor.")
         notes.append("Mechanics use internal Prestige Tier 1-5, not hardcoded noble names.")
+    elif is_enchantment_asset_type(asset_type_clean):
+        notes.append("Combat enchantment. No passive income. Staff approval required.")
+        notes.append("Sequential chain only: +1 must be purchased before +2, and upgrades advance one rank at a time.")
+        eff = enchantment_effect_label(asset_type_clean, tier_code)
+        if eff:
+            notes.append(f"Effect: {eff}.")
     return notes
 
 def fetch_asset_definition_sync(asset_type: str, tier_code: str) -> Optional[dict[str, Any]]:
@@ -1419,6 +1473,23 @@ def count_settlement_assets_sync(guild_id: int, character_id: int) -> int:
             return int(row.get("n") or 0)
 
 
+def current_enchantment_rank_sync(guild_id: int, character_id: int, asset_type: str) -> int:
+    if not is_enchantment_asset_type(asset_type):
+        return 0
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(MAX(NULLIF(regexp_replace(COALESCE(tier_code,''), '[^0-9]', '', 'g'), '')::integer), 0) AS rank
+                FROM econ.assets
+                WHERE guild_id = %s AND character_id = %s AND asset_type = %s;
+                """,
+                (guild_id, character_id, asset_type),
+            )
+            row = cur.fetchone() or {}
+            return int(row.get("rank") or 0)
+
+
 def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], current_prestige: int, *, is_new_purchase: bool, guild_id: int, character_id: int) -> Optional[str]:
     asset_type = str(asset_type or "").strip()
     tier = tier_rank(target_tier_code) or 0
@@ -1448,6 +1519,19 @@ def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], 
         if tier >= 1 and current_prestige < 1:
             return "Keep/Castle holdings require Prestige Tier 1."
 
+    if is_enchantment_asset_type(asset_type):
+        current_rank = current_enchantment_rank_sync(guild_id, character_id, asset_type)
+        if is_new_purchase:
+            if current_rank > 0:
+                return "This character already has that enchantment track. Use /upgrade-asset to improve it."
+            if tier != 1:
+                return "Enchantments must be purchased sequentially. Purchase +1 first, then upgrade one rank at a time."
+        else:
+            if current_rank <= 0:
+                return "This character does not own that enchantment track yet. Purchase +1 first."
+            if tier != current_rank + 1:
+                return f"Enchantments must upgrade one rank at a time. Current rank is +{current_rank}; next valid upgrade is +{current_rank + 1}."
+
     return None
 
 
@@ -1456,7 +1540,7 @@ def fetch_owned_assets_for_upgrade_sync(guild_id: int, character_id: int) -> lis
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name
+                SELECT id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name, combat_bonus_type, combat_bonus_value, combat_bonus_scope
                 FROM econ.assets
                 WHERE guild_id = %s
                   AND character_id = %s
@@ -1501,6 +1585,9 @@ def create_asset_request_sync(
     title_style: Optional[str] = None,
     display_title: Optional[str] = None,
     domain_name: Optional[str] = None,
+    combat_bonus_type: Optional[str] = None,
+    combat_bonus_value: Optional[int] = None,
+    combat_bonus_scope: Optional[str] = None,
 ) -> int:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1509,11 +1596,12 @@ def create_asset_request_sync(
                 INSERT INTO econ.asset_requests (
                     guild_id, request_type, status, character_id, user_id, asset_id, asset_type,
                     from_tier_code, to_tier_code, asset_name, kingdom, cost_embers, income_embers,
-                    prestige_tier, title_style, display_title, domain_name
-                ) VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    prestige_tier, title_style, display_title, domain_name,
+                    combat_bonus_type, combat_bonus_value, combat_bonus_scope
+                ) VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
-                (guild_id, request_type, character_id, user_id, asset_id, asset_type, from_tier_code, to_tier_code, asset_name, kingdom, int(cost_embers), int(income_embers), prestige_tier, title_style, display_title, domain_name),
+                (guild_id, request_type, character_id, user_id, asset_id, asset_type, from_tier_code, to_tier_code, asset_name, kingdom, int(cost_embers), int(income_embers), prestige_tier, title_style, display_title, domain_name, combat_bonus_type, combat_bonus_value, combat_bonus_scope),
             )
             request_id = int(cur.fetchone()["id"])
         conn.commit()
@@ -1616,11 +1704,12 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     """
                     INSERT INTO econ.assets (
                         guild_id, character_id, asset_type, tier_code, asset_name, kingdom,
-                        income_embers, created_by_user_id, prestige_tier, title_style, display_title, domain_name, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        income_embers, created_by_user_id, prestige_tier, title_style, display_title, domain_name,
+                        combat_bonus_type, combat_bonus_value, combat_bonus_scope, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING id;
                     """,
-                    (guild_id, character_id, req["asset_type"], req["to_tier_code"], req["asset_name"], req.get("kingdom"), int(req.get("income_embers") or 0), staff_user_id, req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name")),
+                    (guild_id, character_id, req["asset_type"], req["to_tier_code"], req["asset_name"], req.get("kingdom"), int(req.get("income_embers") or 0), staff_user_id, req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope")),
                 )
                 asset_id = int(cur.fetchone()["id"])
             elif req["request_type"] == "upgrade":
@@ -1656,10 +1745,13 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                         title_style = %s,
                         display_title = %s,
                         domain_name = %s,
+                        combat_bonus_type = %s,
+                        combat_bonus_value = %s,
+                        combat_bonus_scope = %s,
                         updated_at = NOW()
                     WHERE guild_id = %s AND id = %s;
                     """,
-                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), guild_id, asset_id),
+                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope"), guild_id, asset_id),
                 )
             else:
                 conn.rollback()
@@ -2696,6 +2788,8 @@ def build_asset_request_embed(req: dict[str, Any], character_name: str | None = 
         embed.add_field(name="Rendered Title", value=clean_text(req.get("display_title")), inline=False)
     embed.add_field(name="Kingdom/Land", value=clean_text(req.get("kingdom")) or "—", inline=True)
     embed.add_field(name="Cost", value=f"**{format_currency(int(req.get('cost_embers') or 0))}**", inline=True)
+    if is_enchantment_asset_type(str(req.get("asset_type") or "")):
+        embed.add_field(name="Combat Effect", value=clean_text(enchantment_effect_label(str(req.get("asset_type") or ""), str(req.get("to_tier_code") or ""))), inline=True)
     income = int(req.get("income_embers") or 0)
     embed.add_field(name="Daily Income", value=format_currency(income, show_base_total=False), inline=True)
     gate_notes = prestige_gate_notes_for_asset(str(req.get("asset_type") or ""), str(req.get("to_tier_code") or ""))
@@ -2877,6 +2971,9 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
         prestige_tier = prestige_tier_from_asset_type_tier(self.asset_type, self.tier_code)
         title_style = title_style_for_kingdom(ref.kingdom) if self.asset_type == "Noble Title" else None
         display_title = render_title_display(ref.kingdom, int(prestige_tier or 0), clean_name) if self.asset_type == "Noble Title" else None
+        combat_bonus_type = enchantment_bonus_type(self.asset_type)
+        combat_bonus_value = tier_rank(self.tier_code) if is_enchantment_asset_type(self.asset_type) else None
+        combat_bonus_scope = "all_attacks" if self.asset_type == "Enchantment - Accuracy" else "damage" if self.asset_type == "Enchantment - Potency" else "ac" if self.asset_type == "Enchantment - Warding" else None
         request_id = await run_db(
             create_asset_request_sync,
             guild_id,
@@ -2895,6 +2992,9 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
             title_style,
             display_title,
             clean_name if self.asset_type == "Noble Title" else None,
+            combat_bonus_type,
+            combat_bonus_value,
+            combat_bonus_scope,
         )
         await post_asset_request_to_staff_channel(guild_id, request_id, ref.name)
         await log_to_channel("asset_purchase_requested", [f"Request ID: **{request_id}**", f"Character: **{clean_text(ref.name)}**", f"Asset: **{clean_name}** — {self.asset_type}", f"Tier: **{self.tier_code}**", f"Cost: **{format_currency(int(cost))}**"])
@@ -2948,6 +3048,8 @@ class PurchaseAssetView(discord.ui.View):
             tiers = await run_db(fetch_tiers_for_type_sync, self.asset_type)
             tier_options = []
             for t in tiers[:25]:
+                if is_enchantment_asset_type(self.asset_type) and (tier_rank(t.get("tier_code")) or 0) != 1:
+                    continue
                 cost = await run_db(cumulative_cost_to_tier_sync, self.asset_type, str(t["tier_code"]))
                 desc = f"Cost: {format_currency(int(cost or 0), show_base_total=False)}"
                 income = int(t.get("income_embers") or 0)
@@ -3064,6 +3166,8 @@ class UpgradeAssetView(discord.ui.View):
                             tr = tier_rank(t.get("tier_code"))
                             if cur_rank is not None and tr is not None and tr <= cur_rank:
                                 continue
+                            if is_enchantment_asset_type(selected["asset_type"]) and cur_rank is not None and tr is not None and tr != cur_rank + 1:
+                                continue
                             cost = await run_db(incremental_cost_between_tiers_sync, selected["asset_type"], selected["tier_code"], str(t["tier_code"]))
                             desc = f"Upgrade cost: {format_currency(int(cost or 0), show_base_total=False)}"
                             tier_options.append(discord.SelectOption(label=str(t["tier_code"])[:100], value=str(t["tier_code"])[:100], description=desc[:100], default=(self.target_tier == str(t["tier_code"]))))
@@ -3110,6 +3214,9 @@ class UpgradeAssetView(discord.ui.View):
         title_kingdom = asset.get("kingdom") or ref.kingdom
         title_style = title_style_for_kingdom(title_kingdom) if asset["asset_type"] == "Noble Title" else None
         display_title = render_title_display(title_kingdom, int(prestige_tier or 0), asset.get("asset_name")) if asset["asset_type"] == "Noble Title" else None
+        combat_bonus_type = enchantment_bonus_type(asset["asset_type"])
+        combat_bonus_value = tier_rank(self.target_tier) if is_enchantment_asset_type(asset["asset_type"]) else None
+        combat_bonus_scope = "all_attacks" if asset["asset_type"] == "Enchantment - Accuracy" else "damage" if asset["asset_type"] == "Enchantment - Potency" else "ac" if asset["asset_type"] == "Enchantment - Warding" else None
         request_id = await run_db(
             create_asset_request_sync,
             guild_id,
@@ -3128,6 +3235,9 @@ class UpgradeAssetView(discord.ui.View):
             title_style,
             display_title,
             asset.get("asset_name") if asset["asset_type"] == "Noble Title" else None,
+            combat_bonus_type,
+            combat_bonus_value,
+            combat_bonus_scope,
         )
         await post_asset_request_to_staff_channel(guild_id, request_id, ref.name)
         await log_to_channel("asset_upgrade_requested", [f"Request ID: **{request_id}**", f"Character: **{clean_text(ref.name)}**", f"Asset: **{clean_text(asset['asset_name'])}** — {clean_text(asset['asset_type'])}", f"From: **{clean_text(asset['tier_code'])}**", f"To: **{clean_text(self.target_tier)}**", f"Cost: **{format_currency(int(cost))}**"])
