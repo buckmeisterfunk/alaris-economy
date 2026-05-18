@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v021
+# Alaris_EconomyBot_v022
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v021: Adds purchasable combat enchantments as expensive sequential upgrade chains: Warding +1-5 AC, Accuracy +1-5 attack rolls, Potency +1-5 damage. Preserves v020 command cleanup and all v019/v020 economy features.
+# v022: Corrects settlement prestige gates: Village requires Prestige Tier 1, Town requires Prestige Tier 2, Small City requires Prestige Tier 3. Preserves v021 enchantments and all existing economy features.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v021"
+APP_VERSION = "Alaris_EconomyBot_v022"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -1334,10 +1334,12 @@ def prestige_gate_notes_for_asset(asset_type: str, tier_code: str | None) -> lis
         if rank == 1:
             notes.append("Requires staff review. Sovereign lands need a land-leader approval scene; free lands need local-authority recognition.")
             notes.append("Name is optional until Village status.")
+        elif rank == 3:
+            notes.append("Requires Prestige Tier 1+ for Village.")
         elif rank == 4:
-            notes.append("Requires Prestige Tier 1+ before upgrading beyond Village into Town.")
+            notes.append("Requires Prestige Tier 2+ for Town.")
         elif rank == 5:
-            notes.append("Requires Prestige Tier 2+ for Small City.")
+            notes.append("Requires Prestige Tier 3+ for Small City.")
     elif asset_type_clean == "Keep/Castle":
         if rank == 1:
             notes.append("Requires Prestige Tier 1+.")
@@ -1505,11 +1507,15 @@ def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], 
                     return "Prestige Tier 3-4 characters may hold no more than 3 settlement chains."
                 if current_prestige >= 5 and count >= 6:
                     return "Prestige Tier 5 characters may hold no more than 6 settlement chains."
-        # Upgrading beyond Village/T3 requires prestige. Small City/T5 requires Prestige Tier 2.
-        if tier >= 5 and current_prestige < 2:
-            return "Small City requires Prestige Tier 2."
-        if tier >= 4 and current_prestige < 1:
-            return "Town and higher settlement upgrades require Prestige Tier 1."
+        # Settlement prestige gates are progressive:
+        # Village/T3 requires Prestige Tier 1, Town/T4 requires Prestige Tier 2,
+        # and Small City/T5 requires Prestige Tier 3.
+        if tier >= 5 and current_prestige < 3:
+            return "Small City requires Prestige Tier 3."
+        if tier >= 4 and current_prestige < 2:
+            return "Town requires Prestige Tier 2."
+        if tier >= 3 and current_prestige < 1:
+            return "Village requires Prestige Tier 1."
 
     if asset_type == "Keep/Castle":
         if tier >= 4 and current_prestige < 3:
