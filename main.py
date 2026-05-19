@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v022
+# Alaris_EconomyBot_v023
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v022: Corrects settlement prestige gates: Village requires Prestige Tier 1, Town requires Prestige Tier 2, Small City requires Prestige Tier 3. Preserves v021 enchantments and all existing economy features.
+# v023: Adds daily income reminder posting, owner-only source autocomplete for /econ-transfer, and clearer already-claimed income messaging. Preserves v022 settlement gates, v021 enchantments, and all existing economy features.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -17,7 +17,7 @@ import re
 import traceback
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Optional
 
 import discord
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v022"
+APP_VERSION = "Alaris_EconomyBot_v023"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -222,6 +222,16 @@ STAFF_ROLE_IDS = _get_int_list_env("STAFF_ROLE_IDS")
 ECON_LOG_CHANNEL_ID = _get_int_env("ECON_LOG_CHANNEL_ID", 1504528860237136022)
 ASSET_REQUEST_CHANNEL_ID = _get_int_env("ASSET_REQUEST_CHANNEL_ID", 1504610669800980532)
 BANK_CHANNEL_ID = _get_int_env("BANK_CHANNEL_ID")
+INCOME_REMINDER_CHANNEL_ID = _get_int_env("INCOME_REMINDER_CHANNEL_ID", BANK_CHANNEL_ID)
+INCOME_REMINDER_ROLE_ID = _get_int_env("INCOME_REMINDER_ROLE_ID", 1505325457112043720)
+INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 13) or 13
+INCOME_REMINDER_MINUTE = _get_int_env("INCOME_REMINDER_MINUTE", 30) or 30
+INCOME_REMINDER_TEXT = (
+    os.getenv("INCOME_REMINDER_TEXT")
+    or f"<@&{INCOME_REMINDER_ROLE_ID}>: 🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
+       "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙"
+)
+_income_reminder_task: Optional[asyncio.Task] = None
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
@@ -2043,6 +2053,61 @@ async def log_to_channel(action: str, lines: list[str]) -> None:
         print(f"[warn] Unexpected economy log failure for {ECON_LOG_CHANNEL_ID}: {exc}")
 
 
+def seconds_until_next_income_reminder(now: Optional[datetime] = None) -> float:
+    tz = CHICAGO_TZ
+    current = now or datetime.now(tz)
+    target = current.replace(
+        hour=max(0, min(23, int(INCOME_REMINDER_HOUR))),
+        minute=max(0, min(59, int(INCOME_REMINDER_MINUTE))),
+        second=0,
+        microsecond=0,
+    )
+    if target <= current:
+        target = target + timedelta(days=1)
+    return max(1.0, (target - current).total_seconds())
+
+
+async def post_income_reminder_once() -> bool:
+    if not INCOME_REMINDER_CHANNEL_ID:
+        print("[warn] Income reminder channel is not configured. Set INCOME_REMINDER_CHANNEL_ID to enable daily reminders.")
+        return False
+    try:
+        channel = client.get_channel(int(INCOME_REMINDER_CHANNEL_ID))
+        if channel is None:
+            channel = await client.fetch_channel(int(INCOME_REMINDER_CHANNEL_ID))
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            print(f"[warn] Income reminder target is not a text channel/thread: {INCOME_REMINDER_CHANNEL_ID}")
+            return False
+        await channel.send(
+            INCOME_REMINDER_TEXT[:1900],
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+        return True
+    except discord.Forbidden as exc:
+        print(f"[warn] Missing access/send permission for income reminder channel {INCOME_REMINDER_CHANNEL_ID}: {exc}")
+    except discord.HTTPException as exc:
+        print(f"[warn] Failed to send income reminder message to {INCOME_REMINDER_CHANNEL_ID}: {exc}")
+    except Exception as exc:
+        print(f"[warn] Unexpected income reminder failure for {INCOME_REMINDER_CHANNEL_ID}: {exc}")
+        traceback.print_exc()
+    return False
+
+
+async def income_reminder_loop() -> None:
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            await asyncio.sleep(seconds_until_next_income_reminder())
+            await post_income_reminder_once()
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[warn] Income reminder loop error: {exc}")
+            traceback.print_exc()
+            await asyncio.sleep(300)
+
+
 async def resolve_character_or_reply(interaction: discord.Interaction, character: str) -> Optional[CharacterRef]:
     guild_id = interaction.guild_id or GUILD_ID
     ref = await run_db(fetch_character_by_name_sync, int(guild_id), character)
@@ -2371,12 +2436,15 @@ class IncomeClaimView(discord.ui.View):
                 )
             embed.add_field(name="Claimed", value="\n".join(lines)[:1024], inline=False)
         if already:
-            embed.add_field(name="Already Claimed Today", value="\n".join(f"• {n}" for n in already)[:1024], inline=False)
+            embed.add_field(name="Already Claimed Today", value=("This character has already claimed daily income today." if len(already) == 1 else "These characters have already claimed daily income today.") + "\n" + "\n".join(f"• {n}" for n in already)[:900], inline=False)
         if missing_kingdom:
             embed.add_field(name="Missing Kingdom/Land", value="\n".join(f"• {n}" for n in missing_kingdom)[:1024], inline=False)
         if failed:
             embed.add_field(name="Skipped", value="\n".join(f"• {n}" for n in failed)[:1024], inline=False)
         embed.add_field(name="Total Net Earned", value=f"**{format_currency(total_net)}**", inline=False)
+        if not successful and already and not missing_kingdom and not failed:
+            embed.title = "Daily Income Already Claimed"
+            embed.description = "This character has already claimed daily income today." if len(already) == 1 else "These characters have already claimed daily income today."
 
         for child in self.children:
             child.disabled = True
@@ -2459,7 +2527,7 @@ async def econ_adjust(interaction: discord.Interaction, character: str, delta_em
     target_character="The character receiving the currency",
     amount_embers="Amount to transfer in Embers/base units",
 )
-@app_commands.autocomplete(source_character=character_autocomplete, target_character=character_autocomplete)
+@app_commands.autocomplete(source_character=owned_character_autocomplete, target_character=character_autocomplete)
 async def econ_transfer(interaction: discord.Interaction, source_character: str, target_character: str, amount_embers: int):
     await interaction.response.defer(ephemeral=True)
     if amount_embers <= 0:
@@ -3431,6 +3499,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @client.event
 async def on_ready():
+    global _income_reminder_task
     print(f"[startup] {APP_VERSION} logged in as {client.user}")
     print(f"[startup] Guild ID: {GUILD_ID}")
     try:
@@ -3450,6 +3519,10 @@ async def on_ready():
     except Exception as exc:
         print(f"[startup][ERROR] command sync failed: {exc}")
         traceback.print_exc()
+
+    if _income_reminder_task is None or _income_reminder_task.done():
+        _income_reminder_task = asyncio.create_task(income_reminder_loop())
+        print(f"[startup] Daily income reminder scheduled for {INCOME_REMINDER_HOUR:02d}:{INCOME_REMINDER_MINUTE:02d} America/Chicago; channel={INCOME_REMINDER_CHANNEL_ID or 'disabled'}")
 
 
 def main():
