@@ -1,5 +1,6 @@
-# Alaris Bot v124  
+# Alaris Bot v125  
 
+# v125: Posts a compact HP health summary whenever combat initiative wraps back to the top of the order.
 # v124: Fixes /character-grant-xp XP pipeline call, hides empty economy/tournament sections on character cards, and ensures optional enemy metadata columns exist.
 # v123: Hardens character autocomplete for staff/player commands, especially /character-grant-xp, and documents command wiring audit.
 # v118: Full replacement based on v117. Adds the missing enchantment combat bridge:
@@ -7489,6 +7490,49 @@ async def current_turn_combatant(encounter_id: int) -> Optional[dict[str, Any]]:
     return dict(row) if row else None  
   
   
+
+
+def _hp_bar(current_hp: int, max_hp: int, width: int = 10) -> str:  
+    max_hp = max(1, int(max_hp or 1))  
+    current_hp = max(0, int(current_hp or 0))  
+    filled = max(0, min(width, round((current_hp / max_hp) * width)))  
+    return "█" * filled + "░" * (width - filled)  
+  
+  
+def _format_health_line(combatant: dict[str, Any]) -> str:  
+    name = clean_text(combatant.get("name") or "Unknown")  
+    current_hp = int(combatant.get("current_hp") or 0)  
+    max_hp = int(combatant.get("max_hp") or 0)  
+    status = str(combatant.get("status") or "active")  
+    status_note = "" if status == "active" else f" — `{status}`"  
+    return f"• **{name}** — `{current_hp}/{max_hp} HP` `{_hp_bar(current_hp, max_hp)}`{status_note}"  
+  
+  
+async def build_round_health_summary(encounter_id: int, round_number: int) -> str:  
+    combatants = await get_combatants(encounter_id, active_only=False)  
+    characters = [c for c in combatants if c.get("combatant_type") == "character"]  
+    enemies = [c for c in combatants if c.get("combatant_type") == "enemy"]  
+  
+    lines: list[str] = [f"🩸 **Round {int(round_number)} Health Summary**"]  
+    if characters:  
+        lines.append("\n**Characters**")  
+        lines.extend(_format_health_line(c) for c in characters)  
+    if enemies:  
+        lines.append("\n**Enemies**")  
+        lines.extend(_format_health_line(c) for c in enemies)  
+    return "\n".join(lines)  
+  
+  
+async def post_round_health_summary_if_needed(channel: discord.abc.Messageable, encounter_id: int, next_actor: Optional[dict[str, Any]]) -> None:  
+    if not next_actor or not next_actor.get("_round_started"):  
+        return  
+    try:  
+        summary = await build_round_health_summary(encounter_id, int(next_actor.get("_round_number") or 1))  
+        await channel.send(summary)  
+    except Exception:  
+        LOG.exception("Failed to post round health summary for combat encounter %s.", encounter_id)  
+  
+  
 async def advance_combat_turn(encounter_id: int) -> Optional[dict[str, Any]]:  
     async with db_pool.acquire() as conn:  
         combat = await conn.fetchrow(  
@@ -7513,12 +7557,14 @@ async def advance_combat_turn(encounter_id: int) -> Optional[dict[str, Any]]:
   
         idx = int(combat["current_turn_index"] or 0)  
         round_number = int(combat["round_number"] or 1)  
+        round_started = False  
   
         for _ in range(len(order)):  
             idx += 1  
             if idx >= len(order):  
                 idx = 0  
                 round_number += 1  
+                round_started = True  
             cid = int(order[idx]["combatant_id"])  
             if cid in active_ids:  
                 await conn.execute(  
@@ -7533,7 +7579,12 @@ async def advance_combat_turn(encounter_id: int) -> Optional[dict[str, Any]]:
                 )  
                 await conn.execute("UPDATE alaris_combatants SET action_taken=FALSE WHERE id=$1;", cid)  
                 row = await conn.fetchrow("SELECT * FROM alaris_combatants WHERE id=$1;", cid)  
-                return dict(row) if row else None  
+                if not row:  
+                    return None  
+                payload = dict(row)  
+                payload["_round_started"] = bool(round_started)  
+                payload["_round_number"] = int(round_number)  
+                return payload  
     return None  
   
   
@@ -9249,6 +9300,7 @@ async def npc_auto_turn_loop(channel: discord.abc.Messageable, encounter_id: int
         if not next_actor:  
             return  
   
+        await post_round_health_summary_if_needed(channel, encounter_id, next_actor)  
         await post_current_turn(channel, encounter_id)  
         if next_actor["combatant_type"] == "character":  
             return  
@@ -12086,6 +12138,7 @@ async def end_turn(interaction: discord.Interaction):
     if not next_actor:  
         return  
   
+    await post_round_health_summary_if_needed(interaction.channel, int(combat["id"]), next_actor)  
     await post_current_turn(interaction.channel, int(combat["id"]))  
   
     if next_actor["combatant_type"] == "enemy":  
