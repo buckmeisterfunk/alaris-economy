@@ -1,7 +1,7 @@
 # Alaris_EconomyBot_v023
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v023: Adds daily income reminder posting, owner-only source autocomplete for /econ-transfer, and clearer already-claimed income messaging. Preserves v022 settlement gates, v021 enchantments, and all existing economy features.
+# v024: Locks daily income reminder to 12:30 PM America/Chicago in channel 1496692563388666002 with the updated Get That Bread message. Preserves v023 owner-only transfer source autocomplete and income claim messaging.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v023"
+APP_VERSION = "Alaris_EconomyBot_v024"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -222,13 +222,15 @@ STAFF_ROLE_IDS = _get_int_list_env("STAFF_ROLE_IDS")
 ECON_LOG_CHANNEL_ID = _get_int_env("ECON_LOG_CHANNEL_ID", 1504528860237136022)
 ASSET_REQUEST_CHANNEL_ID = _get_int_env("ASSET_REQUEST_CHANNEL_ID", 1504610669800980532)
 BANK_CHANNEL_ID = _get_int_env("BANK_CHANNEL_ID")
-INCOME_REMINDER_CHANNEL_ID = _get_int_env("INCOME_REMINDER_CHANNEL_ID", BANK_CHANNEL_ID)
+# Daily income reminder defaults. America/Chicago handles CST/CDT automatically.
+INCOME_REMINDER_CHANNEL_ID = _get_int_env("INCOME_REMINDER_CHANNEL_ID", 1496692563388666002)
 INCOME_REMINDER_ROLE_ID = _get_int_env("INCOME_REMINDER_ROLE_ID", 1505325457112043720)
-INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 13) or 13
+INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 12) or 12
 INCOME_REMINDER_MINUTE = _get_int_env("INCOME_REMINDER_MINUTE", 30) or 30
 INCOME_REMINDER_TEXT = (
     os.getenv("INCOME_REMINDER_TEXT")
-    or f"<@&{INCOME_REMINDER_ROLE_ID}>: 🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
+    or f":goosehonk: <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** :goosehonk:\n\n"
+       "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
        "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙"
 )
 _income_reminder_task: Optional[asyncio.Task] = None
