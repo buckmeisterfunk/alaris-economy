@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v025
+# Alaris_EconomyBot_v026
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v025: Dependency hygiene release. Confirms EconomyBot uses psycopg only for DB access and does not import asyncpg or openai. Preserves v024 daily reminder, v023 owner-only transfer source autocomplete, and income claim messaging.
+# v026: Adds income reminder reaction-role support. Daily reminder posts include a coin reaction players can click to claim the reminder role. Preserves psycopg-only dependency mode, v024 fixed 12:30 PM America/Chicago reminder, owner-only transfer source autocomplete, and income claim messaging.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v025"
+APP_VERSION = "Alaris_EconomyBot_v026"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -227,11 +227,13 @@ INCOME_REMINDER_CHANNEL_ID = _get_int_env("INCOME_REMINDER_CHANNEL_ID", 14966925
 INCOME_REMINDER_ROLE_ID = _get_int_env("INCOME_REMINDER_ROLE_ID", 1505325457112043720)
 INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 12) or 12
 INCOME_REMINDER_MINUTE = _get_int_env("INCOME_REMINDER_MINUTE", 30) or 30
+INCOME_REMINDER_REACTION = os.getenv("INCOME_REMINDER_REACTION", "🪙")
 INCOME_REMINDER_TEXT = (
     os.getenv("INCOME_REMINDER_TEXT")
     or f":goosehonk: <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** :goosehonk:\n\n"
        "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
-       "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙"
+       "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙\n\n"
+       f"React with {INCOME_REMINDER_REACTION} to get daily income reminders."
 )
 _income_reminder_task: Optional[asyncio.Task] = None
 
@@ -245,6 +247,7 @@ if not GUILD_ID:
 
 intents = discord.Intents.default()
 intents.members = True
+intents.reactions = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -496,6 +499,20 @@ def ensure_schema_sync() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (guild_id, idx)
+                );
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS econ.income_reminder_posts (
+                    guild_id BIGINT NOT NULL,
+                    reminder_date DATE NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    emoji TEXT NOT NULL DEFAULT '🪙',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, reminder_date)
                 );
                 """
             )
@@ -2055,6 +2072,42 @@ async def log_to_channel(action: str, lines: list[str]) -> None:
         print(f"[warn] Unexpected economy log failure for {ECON_LOG_CHANNEL_ID}: {exc}")
 
 
+def store_income_reminder_post_sync(guild_id: int, reminder_date: date, channel_id: int, message_id: int, emoji: str) -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO econ.income_reminder_posts (guild_id, reminder_date, channel_id, message_id, emoji, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, reminder_date) DO UPDATE SET
+                    channel_id = EXCLUDED.channel_id,
+                    message_id = EXCLUDED.message_id,
+                    emoji = EXCLUDED.emoji,
+                    created_at = NOW();
+                """,
+                (guild_id, reminder_date, channel_id, message_id, emoji),
+            )
+        conn.commit()
+
+
+def is_tracked_income_reminder_post_sync(guild_id: int, channel_id: int, message_id: int, emoji: str) -> bool:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM econ.income_reminder_posts
+                WHERE guild_id = %s
+                  AND channel_id = %s
+                  AND message_id = %s
+                  AND emoji = %s
+                LIMIT 1;
+                """,
+                (guild_id, channel_id, message_id, emoji),
+            )
+            return cur.fetchone() is not None
+
+
 def seconds_until_next_income_reminder(now: Optional[datetime] = None) -> float:
     tz = CHICAGO_TZ
     current = now or datetime.now(tz)
@@ -2080,10 +2133,27 @@ async def post_income_reminder_once() -> bool:
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             print(f"[warn] Income reminder target is not a text channel/thread: {INCOME_REMINDER_CHANNEL_ID}")
             return False
-        await channel.send(
+        msg = await channel.send(
             INCOME_REMINDER_TEXT[:1900],
             allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
         )
+        try:
+            await msg.add_reaction(INCOME_REMINDER_REACTION)
+        except discord.HTTPException as exc:
+            print(f"[warn] Income reminder posted but reaction {INCOME_REMINDER_REACTION!r} could not be added: {exc}")
+        try:
+            if GUILD_ID:
+                await run_db(
+                    store_income_reminder_post_sync,
+                    int(GUILD_ID),
+                    datetime.now(CHICAGO_TZ).date(),
+                    int(msg.channel.id),
+                    int(msg.id),
+                    str(INCOME_REMINDER_REACTION),
+                )
+        except Exception as exc:
+            print(f"[warn] Income reminder posted but tracking row could not be stored: {exc}")
+        print(f"[startup] Posted daily income reminder to channel={msg.channel.id} message={msg.id}")
         return True
     except discord.Forbidden as exc:
         print(f"[warn] Missing access/send permission for income reminder channel {INCOME_REMINDER_CHANNEL_ID}: {exc}")
@@ -3500,6 +3570,68 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 @client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Grant the daily-income reminder role when a player reacts to a tracked reminder post."""
+    if payload.user_id == getattr(client.user, "id", None):
+        return
+    if not INCOME_REMINDER_ROLE_ID:
+        return
+    if str(payload.emoji) != str(INCOME_REMINDER_REACTION):
+        return
+    if not payload.guild_id or not payload.channel_id or not payload.message_id:
+        return
+
+    try:
+        tracked = await run_db(
+            is_tracked_income_reminder_post_sync,
+            int(payload.guild_id),
+            int(payload.channel_id),
+            int(payload.message_id),
+            str(INCOME_REMINDER_REACTION),
+        )
+    except Exception as exc:
+        print(f"[warn] Could not verify income reminder reaction tracking row: {exc}")
+        return
+    if not tracked:
+        return
+
+    guild = client.get_guild(int(payload.guild_id))
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(int(payload.guild_id))
+        except Exception as exc:
+            print(f"[warn] Could not fetch guild for income reminder role reaction: {exc}")
+            return
+
+    role = guild.get_role(int(INCOME_REMINDER_ROLE_ID))
+    if role is None:
+        print(f"[warn] Income reminder role {INCOME_REMINDER_ROLE_ID} was not found in guild {payload.guild_id}.")
+        return
+
+    member = guild.get_member(int(payload.user_id))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(payload.user_id))
+        except Exception as exc:
+            print(f"[warn] Could not fetch member {payload.user_id} for income reminder role reaction: {exc}")
+            return
+
+    if role in getattr(member, "roles", []):
+        return
+
+    try:
+        await member.add_roles(role, reason="Reacted to daily income reminder post")
+        print(f"[startup] Added income reminder role {INCOME_REMINDER_ROLE_ID} to user {payload.user_id} via reaction.")
+    except discord.Forbidden as exc:
+        print(f"[warn] Missing permission or role hierarchy blocked income reminder role assignment {INCOME_REMINDER_ROLE_ID} to user {payload.user_id}: {exc}")
+    except discord.HTTPException as exc:
+        print(f"[warn] Discord rejected income reminder role assignment {INCOME_REMINDER_ROLE_ID} to user {payload.user_id}: {exc}")
+    except Exception as exc:
+        print(f"[warn] Unexpected income reminder role assignment failure for user {payload.user_id}: {exc}")
+        traceback.print_exc()
+
+
+@client.event
 async def on_ready():
     global _income_reminder_task
     print(f"[startup] {APP_VERSION} logged in as {client.user}")
@@ -3507,7 +3639,6 @@ async def on_ready():
     try:
         await run_db(ensure_schema_sync)
         print("[startup] Economy schema ensured.")
-        print("[startup] Dependency mode: psycopg only; no asyncpg/openai imports required.")
         sync_result = await run_db(sync_public_characters_from_alaris_sync, GUILD_ID)
         print(f"[startup] Character sync result: {sync_result}")
     except Exception as exc:
