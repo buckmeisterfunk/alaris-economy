@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v026"
+APP_VERSION = "Alaris_EconomyBot_v028"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -228,13 +228,37 @@ INCOME_REMINDER_ROLE_ID = _get_int_env("INCOME_REMINDER_ROLE_ID", 15053254571120
 INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 12) or 12
 INCOME_REMINDER_MINUTE = _get_int_env("INCOME_REMINDER_MINUTE", 30) or 30
 INCOME_REMINDER_REACTION = os.getenv("INCOME_REMINDER_REACTION", "🪙")
-INCOME_REMINDER_TEXT = (
-    os.getenv("INCOME_REMINDER_TEXT")
-    or f":goosehonk: <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** :goosehonk:\n\n"
-       "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
-       "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙\n\n"
-       f"React with {INCOME_REMINDER_REACTION} to get daily income reminders."
-)
+GOOSEHONK_EMOJI = "<a:goosehonk:1147030043462217750>"
+
+
+def normalize_income_reminder_text(raw: Optional[str]) -> str:
+    """Build/sanitize the daily income reminder text.
+
+    Discord custom emojis do not render from :emoji_name: aliases in bot-sent
+    messages. They must be sent as <:name:id> or <a:name:id>. This sanitizer
+    protects us even if Railway still has an older INCOME_REMINDER_TEXT env var
+    containing :goosehonk: or an escaped custom emoji copied from Discord.
+    """
+    fallback = (
+        f"{GOOSEHONK_EMOJI} <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** {GOOSEHONK_EMOJI}\n\n"
+        "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
+        "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙\n\n"
+        f"React with {INCOME_REMINDER_REACTION} to get daily income reminders."
+    )
+    text = (raw or fallback).strip()
+    # Fix older/env-configured reminder text that used Discord's typed alias.
+    text = text.replace(":goosehonk:", GOOSEHONK_EMOJI)
+    # Fix escaped custom emoji strings copied using a leading backslash.
+    text = text.replace(r"\<a:goosehonk:1147030043462217750>", GOOSEHONK_EMOJI)
+    text = text.replace(r"\<:goosehonk:1147030043462217750>", GOOSEHONK_EMOJI)
+    # Fix a non-animated variant if it was accidentally used.
+    text = text.replace("<:goosehonk:1147030043462217750>", GOOSEHONK_EMOJI)
+    if f"React with {INCOME_REMINDER_REACTION}" not in text:
+        text = text.rstrip() + f"\n\nReact with {INCOME_REMINDER_REACTION} to get daily income reminders."
+    return text
+
+
+INCOME_REMINDER_TEXT = normalize_income_reminder_text(os.getenv("INCOME_REMINDER_TEXT"))
 _income_reminder_task: Optional[asyncio.Task] = None
 
 if not DISCORD_TOKEN:
