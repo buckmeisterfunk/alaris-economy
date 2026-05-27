@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v028"
+APP_VERSION = "Alaris_EconomyBot_v029"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -258,7 +258,10 @@ def normalize_income_reminder_text(raw: Optional[str]) -> str:
     return text
 
 
-INCOME_REMINDER_TEXT = normalize_income_reminder_text(os.getenv("INCOME_REMINDER_TEXT"))
+# v029: hard-code the reminder body from code so stale Railway INCOME_REMINDER_TEXT
+# values cannot reintroduce literal :goosehonk: aliases. Discord custom
+# emojis must be sent with the full <a:name:id> syntax to render.
+INCOME_REMINDER_TEXT = normalize_income_reminder_text(None)
 _income_reminder_task: Optional[asyncio.Task] = None
 
 if not DISCORD_TOKEN:
@@ -3681,6 +3684,7 @@ async def on_ready():
     if _income_reminder_task is None or _income_reminder_task.done():
         _income_reminder_task = asyncio.create_task(income_reminder_loop())
         print(f"[startup] Daily income reminder scheduled for {INCOME_REMINDER_HOUR:02d}:{INCOME_REMINDER_MINUTE:02d} America/Chicago; channel={INCOME_REMINDER_CHANNEL_ID or 'disabled'}")
+        print(f"[startup] Income reminder emoji token: {GOOSEHONK_EMOJI}")
 
 
 def main():
