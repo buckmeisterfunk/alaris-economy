@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v029"
+APP_VERSION = "Alaris_EconomyBot_v030"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -1897,6 +1897,149 @@ def deny_asset_request_sync(guild_id: int, request_id: int, staff_user_id: int, 
 
 
 
+def asset_current_value_sync(asset: dict[str, Any]) -> int:
+    """Return the current catalog value of an owned asset.
+
+    For tiered assets this is the cumulative catalog cost through the owned tier.
+    This mirrors the amount invested through purchase + sequential upgrades and is
+    used as the gross resale value before kingdom/location tax.
+    """
+    asset_type = str(asset.get("asset_type") or "").strip()
+    tier_code = str(asset.get("tier_code") or "").strip()
+    if not asset_type or not tier_code:
+        return 0
+    value = cumulative_cost_to_tier_sync(asset_type, tier_code)
+    return max(0, int(value or 0))
+
+
+def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_id: int) -> dict[str, Any]:
+    """Sell an owned asset immediately.
+
+    Sale proceeds are the asset's current catalog value minus the tax rate of the
+    asset's location kingdom/land. If the asset has no stored location, the
+    character's assigned kingdom/land is used as a fallback. The tax portion is
+    deposited into that kingdom/land treasury.
+    """
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.*,
+                       COALESCE(c.name, ac.name) AS character_name,
+                       COALESCE(c.user_id, ac.user_id) AS user_id,
+                       COALESCE(c.kingdom, ac.kingdom) AS character_kingdom
+                FROM econ.assets a
+                LEFT JOIN public.characters c ON c.guild_id = a.guild_id AND c.character_id = a.character_id
+                LEFT JOIN public.alaris_characters ac ON ac.guild_id = a.guild_id AND ac.id = a.character_id
+                WHERE a.guild_id = %s AND a.character_id = %s AND a.id = %s
+                FOR UPDATE;
+                """,
+                (guild_id, character_id, asset_id),
+            )
+            asset = cur.fetchone()
+            if not asset:
+                conn.rollback()
+                return {"ok": False, "reason": "asset_not_found"}
+            asset = dict(asset)
+            if int(asset.get("user_id") or 0) != int(actor_user_id):
+                conn.rollback()
+                return {"ok": False, "reason": "not_owner"}
+            asset_type = str(asset.get("asset_type") or "").strip()
+            if asset_type in {"Weapons", "Armor"}:
+                conn.rollback()
+                return {"ok": False, "reason": "asset_not_sellable"}
+
+            gross = asset_current_value_sync(asset)
+            if gross <= 0:
+                conn.rollback()
+                return {"ok": False, "reason": "no_catalog_value"}
+
+            location = clean_text(asset.get("kingdom")) or clean_text(asset.get("character_kingdom")) or "Unaffiliated"
+            cur.execute(
+                "SELECT tax_rate_bp FROM econ.kingdoms WHERE guild_id = %s AND kingdom = %s LIMIT 1;",
+                (guild_id, location),
+            )
+            tax_row = cur.fetchone()
+            tax_bp = int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP)
+            tax = calc_tax(gross, tax_bp)
+            net = max(0, gross - tax)
+
+            cur.execute(
+                """
+                INSERT INTO econ.balances (guild_id, character_id, balance_embers, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (guild_id, character_id)
+                DO UPDATE SET balance_embers = econ.balances.balance_embers + EXCLUDED.balance_embers,
+                              updated_at = NOW()
+                RETURNING balance_embers;
+                """,
+                (guild_id, character_id, net),
+            )
+            new_balance = int(cur.fetchone()["balance_embers"])
+
+            if tax > 0:
+                cur.execute(
+                    """
+                    INSERT INTO econ.kingdoms (guild_id, kingdom, tax_rate_bp, treasury_embers, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (guild_id, kingdom)
+                    DO UPDATE SET treasury_embers = econ.kingdoms.treasury_embers + EXCLUDED.treasury_embers,
+                                  updated_at = NOW();
+                    """,
+                    (guild_id, location, DEFAULT_TAX_BP, tax),
+                )
+
+            cur.execute(
+                """
+                DELETE FROM econ.assets
+                WHERE guild_id = %s AND character_id = %s AND id = %s;
+                """,
+                (guild_id, character_id, asset_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO econ.transactions (guild_id, character_id, actor_user_id, action, amount_embers, details_json)
+                VALUES (%s, %s, %s, 'asset_sold', %s, %s::jsonb);
+                """,
+                (
+                    guild_id,
+                    character_id,
+                    actor_user_id,
+                    net,
+                    json.dumps({
+                        "asset_id": asset_id,
+                        "asset_type": asset.get("asset_type"),
+                        "tier_code": asset.get("tier_code"),
+                        "asset_name": asset.get("asset_name"),
+                        "location": location,
+                        "gross_value_embers": gross,
+                        "tax_embers": tax,
+                        "tax_bp": tax_bp,
+                        "net_embers": net,
+                    }),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason, requested_at)
+                VALUES (%s, %s, 'economy_asset_sold', NOW());
+                """,
+                (guild_id, character_id),
+            )
+        conn.commit()
+    return {
+        "ok": True,
+        "asset": asset,
+        "gross": gross,
+        "tax": tax,
+        "tax_bp": tax_bp,
+        "net": net,
+        "location": location,
+        "new_balance": new_balance,
+    }
+
+
+
 
 def wipe_economy_test_data_sync(guild_id: int, actor_user_id: int) -> dict[str, int]:
     """Guarded test-data wipe for the economy subsystem.
@@ -2703,6 +2846,145 @@ async def econ_transfer(interaction: discord.Interaction, source_character: str,
     )
 
 
+
+class SellAssetView(discord.ui.View):
+    def __init__(self, owner_id: int, characters: list[dict[str, Any]]):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.characters = characters
+        self.character_id: Optional[int] = None
+        self.asset_id: Optional[int] = None
+        self.owned_assets: list[dict[str, Any]] = []
+        self.refresh_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("Only the player who opened this sell flow may use it.", ephemeral=True)
+            return False
+        return True
+
+    def refresh_items(self):
+        self.clear_items()
+        char_options = [
+            discord.SelectOption(
+                label=clean_text(c.get("name"))[:100],
+                value=str(c["character_id"]),
+                description=(clean_text(c.get("kingdom")) or "No kingdom assigned")[:100],
+                default=(self.character_id == int(c["character_id"])),
+            )
+            for c in self.characters[:25]
+        ]
+        if char_options:
+            self.add_item(SellAssetCharacterSelect(char_options))
+        submit = discord.ui.Button(label="Sell Selected Asset", style=discord.ButtonStyle.danger, disabled=not (self.character_id and self.asset_id))
+        async def submit_cb(interaction: discord.Interaction):
+            await self.submit_sale(interaction)
+        submit.callback = submit_cb
+        self.add_item(submit)
+
+    async def rebuild(self, interaction: discord.Interaction, status: str = ""):
+        self.refresh_items()
+        if self.character_id:
+            self.owned_assets = await run_db(fetch_owned_assets_for_upgrade_sync, int(interaction.guild_id or GUILD_ID), self.character_id)
+            if self.owned_assets:
+                asset_options: list[discord.SelectOption] = []
+                for a in self.owned_assets[:25]:
+                    value = await run_db(asset_current_value_sync, a)
+                    label = f"{clean_text(a.get('asset_name'))} — {clean_text(a.get('asset_type'))}"
+                    desc_bits = []
+                    if a.get("tier_code"):
+                        desc_bits.append(clean_text(a.get("tier_code")))
+                    if a.get("kingdom"):
+                        desc_bits.append(clean_text(a.get("kingdom")))
+                    desc_bits.append(f"Value: {format_currency(value, show_base_total=False)}")
+                    asset_options.append(discord.SelectOption(label=label[:100], value=str(a["id"]), description=" | ".join(desc_bits)[:100], default=(self.asset_id == int(a["id"]))))
+                old_submit = self.children[-1]
+                self.remove_item(old_submit)
+                self.add_item(SellOwnedAssetSelect(asset_options))
+                self.add_item(old_submit)
+        embed = discord.Embed(
+            title="Sell Asset",
+            description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds return the asset's current catalog value minus the tax rate of the asset's location kingdom/land.",
+            color=discord.Color.orange(),
+        )
+        if status:
+            embed.add_field(name="Status", value=status[:1024], inline=False)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def submit_sale(self, interaction: discord.Interaction):
+        if not (self.character_id and self.asset_id):
+            await interaction.response.send_message("Choose a character and asset first.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild_id = int(interaction.guild_id or GUILD_ID)
+        result = await run_db(sell_asset_sync, guild_id, int(self.character_id), int(self.asset_id), int(interaction.user.id))
+        if not result.get("ok"):
+            reason = clean_text(result.get("reason") or "unknown")
+            await interaction.followup.send(f"Asset sale could not be completed: `{reason}`.", ephemeral=True)
+            return
+        asset = result["asset"]
+        await log_to_channel(
+            "asset_sold",
+            [
+                f"Character: **{clean_text(asset.get('character_name') or self.character_id)}**",
+                f"Asset: **{clean_text(asset.get('asset_name'))}** — {clean_text(asset.get('asset_type'))}",
+                f"Location: **{clean_text(result.get('location'))}**",
+                f"Gross value: **{format_currency(int(result['gross']))}**",
+                f"Tax: **{format_currency(int(result['tax']))}** ({bp_to_percent(int(result['tax_bp']))})",
+                f"Net returned: **{format_currency(int(result['net']))}**",
+                f"New balance: **{format_currency(int(result['new_balance']))}**",
+                f"Sold by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
+            ],
+        )
+        await interaction.followup.send(
+            "\n".join([
+                f"Sold **{clean_text(asset.get('asset_name'))}** for **{format_currency(int(result['gross']))}** gross value.",
+                f"Kingdom tax ({bp_to_percent(int(result['tax_bp']))}) to **{clean_text(result.get('location'))}**: **{format_currency(int(result['tax']))}**",
+                f"Returned to owner: **{format_currency(int(result['net']))}**",
+                f"New balance: **{format_currency(int(result['new_balance']))}**",
+            ]),
+            ephemeral=True,
+        )
+
+
+class SellAssetCharacterSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Choose one of your characters", min_values=1, max_values=1, options=options)
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, SellAssetView):
+            view.character_id = int(self.values[0])
+            view.asset_id = None
+            await view.rebuild(interaction, "Character selected. Now choose an asset to sell.")
+
+
+class SellOwnedAssetSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Choose owned asset to sell", min_values=1, max_values=1, options=options)
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, SellAssetView):
+            view.asset_id = int(self.values[0])
+            await view.rebuild(interaction, "Asset selected. Press Sell Selected Asset to confirm the sale.")
+
+
+@tree.command(name="sell-asset", description="Sell one of your character's owned assets for its value minus location tax.", guild=discord.Object(id=GUILD_ID))
+async def sell_asset(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild_id = int(interaction.guild_id or GUILD_ID)
+    characters = await run_db(fetch_owned_characters_sync, guild_id, int(interaction.user.id))
+    if not characters:
+        await interaction.followup.send("You do not have any active synced Alaris characters.", ephemeral=True)
+        return
+    view = SellAssetView(interaction.user.id, characters)
+    embed = discord.Embed(
+        title="Sell Asset",
+        description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds return the asset's current catalog value minus the tax rate of the asset's location kingdom/land.",
+        color=discord.Color.orange(),
+    )
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
 @tree.command(name="econ-payout", description="Staff: pay a character for quests, combat, events, or other rewards.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
@@ -3101,11 +3383,12 @@ async def post_asset_request_to_staff_channel(guild_id: int, request_id: int, ch
 class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
     asset_name = discord.ui.TextInput(label="Asset Name", placeholder="Example: The Silver Stag", max_length=80)
 
-    def __init__(self, character_id: int, asset_type: str, tier_code: str):
+    def __init__(self, character_id: int, asset_type: str, tier_code: str, location_kingdom: str):
         super().__init__()
         self.character_id = int(character_id)
         self.asset_type = str(asset_type)
         self.tier_code = str(tier_code)
+        self.location_kingdom = str(location_kingdom or "").strip()
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -3117,8 +3400,8 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
         if int(ref.user_id) != int(interaction.user.id):
             await interaction.followup.send("You may only purchase assets for characters you own.", ephemeral=True)
             return
-        if not ref.kingdom:
-            await interaction.followup.send("This character has no kingdom/land assigned yet. Ask staff to set one before purchasing assets.", ephemeral=True)
+        if not self.location_kingdom or not is_valid_kingdom(self.location_kingdom):
+            await interaction.followup.send("Choose a valid kingdom/land location for this asset before purchasing.", ephemeral=True)
             return
         asset_def = await run_db(fetch_asset_definition_sync, self.asset_type, self.tier_code)
         if not asset_def:
@@ -3142,8 +3425,8 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
             await interaction.followup.send("Asset name cannot be blank.", ephemeral=True)
             return
         prestige_tier = prestige_tier_from_asset_type_tier(self.asset_type, self.tier_code)
-        title_style = title_style_for_kingdom(ref.kingdom) if self.asset_type == "Noble Title" else None
-        display_title = render_title_display(ref.kingdom, int(prestige_tier or 0), clean_name) if self.asset_type == "Noble Title" else None
+        title_style = title_style_for_kingdom(self.location_kingdom) if self.asset_type == "Noble Title" else None
+        display_title = render_title_display(self.location_kingdom, int(prestige_tier or 0), clean_name) if self.asset_type == "Noble Title" else None
         combat_bonus_type = enchantment_bonus_type(self.asset_type)
         combat_bonus_value = tier_rank(self.tier_code) if is_enchantment_asset_type(self.asset_type) else None
         combat_bonus_scope = "all_attacks" if self.asset_type == "Enchantment - Accuracy" else "damage" if self.asset_type == "Enchantment - Potency" else "ac" if self.asset_type == "Enchantment - Warding" else None
@@ -3156,7 +3439,7 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
             self.asset_type,
             self.tier_code,
             clean_name,
-            ref.kingdom,
+            self.location_kingdom,
             int(cost),
             int(asset_def.get("income_embers") or 0),
             None,
@@ -3170,7 +3453,7 @@ class PurchaseAssetNameModal(discord.ui.Modal, title="Name This Asset"):
             combat_bonus_scope,
         )
         await post_asset_request_to_staff_channel(guild_id, request_id, ref.name)
-        await log_to_channel("asset_purchase_requested", [f"Request ID: **{request_id}**", f"Character: **{clean_text(ref.name)}**", f"Asset: **{clean_name}** — {self.asset_type}", f"Tier: **{self.tier_code}**", f"Cost: **{format_currency(int(cost))}**"])
+        await log_to_channel("asset_purchase_requested", [f"Request ID: **{request_id}**", f"Character: **{clean_text(ref.name)}**", f"Asset: **{clean_name}** — {self.asset_type}", f"Location: **{clean_text(self.location_kingdom)}**", f"Tier: **{self.tier_code}**", f"Cost: **{format_currency(int(cost))}**"])
         await interaction.followup.send(f"Purchase request #{request_id} submitted for staff approval.", ephemeral=True)
 
 
@@ -3183,6 +3466,7 @@ class PurchaseAssetView(discord.ui.View):
         self.character_id: Optional[int] = None
         self.asset_type: Optional[str] = None
         self.tier_code: Optional[str] = None
+        self.location_kingdom: Optional[str] = None
         self.refresh_items()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -3200,18 +3484,21 @@ class PurchaseAssetView(discord.ui.View):
             char_options.append(discord.SelectOption(label=label, value=str(c["character_id"]), description=desc, default=(self.character_id == int(c["character_id"]))))
         if char_options:
             self.add_item(PurchaseCharacterSelect(char_options))
+        kingdom_options = [discord.SelectOption(label=k[:100], value=k[:100], default=(self.location_kingdom == k)) for k in CANON_KINGDOMS[:25]]
+        if kingdom_options:
+            self.add_item(PurchaseAssetKingdomSelect(kingdom_options))
         type_options = [discord.SelectOption(label=t[:100], value=t[:100], default=(self.asset_type == t)) for t in self.asset_types[:25]]
         if type_options:
             self.add_item(PurchaseAssetTypeSelect(type_options))
         if self.asset_type:
             # Placeholder tier selector is populated asynchronously by callback response rebuild.
             pass
-        submit = discord.ui.Button(label="Continue", style=discord.ButtonStyle.success, disabled=not (self.character_id and self.asset_type and self.tier_code))
+        submit = discord.ui.Button(label="Continue", style=discord.ButtonStyle.success, disabled=not (self.character_id and self.location_kingdom and self.asset_type and self.tier_code))
         async def submit_cb(interaction: discord.Interaction):
-            if not (self.character_id and self.asset_type and self.tier_code):
-                await interaction.response.send_message("Choose a character, asset type, and tier first.", ephemeral=True)
+            if not (self.character_id and self.location_kingdom and self.asset_type and self.tier_code):
+                await interaction.response.send_message("Choose a character, asset location, asset type, and tier first.", ephemeral=True)
                 return
-            await interaction.response.send_modal(PurchaseAssetNameModal(self.character_id, self.asset_type, self.tier_code))
+            await interaction.response.send_modal(PurchaseAssetNameModal(self.character_id, self.asset_type, self.tier_code, self.location_kingdom))
         submit.callback = submit_cb
         self.add_item(submit)
 
@@ -3235,7 +3522,7 @@ class PurchaseAssetView(discord.ui.View):
                 self.remove_item(old_submit)
                 self.add_item(PurchaseTierSelect(tier_options))
                 self.add_item(old_submit)
-        embed = discord.Embed(title="Purchase Asset", description="Choose one of your characters, an asset type, and a tier name. The bot will check your balance, then send the request to staff for approval.", color=discord.Color.gold())
+        embed = discord.Embed(title="Purchase Asset", description="Choose one of your characters, the asset's kingdom/land location, an asset type, and a tier name. The bot will check your balance, then send the request to staff for approval.", color=discord.Color.gold())
         if status:
             embed.add_field(name="Status", value=status, inline=False)
         await interaction.response.edit_message(embed=embed, view=self)
@@ -3249,6 +3536,16 @@ class PurchaseCharacterSelect(discord.ui.Select):
         if isinstance(view, PurchaseAssetView):
             view.character_id = int(self.values[0])
             await view.rebuild(interaction, "Character selected.")
+
+
+class PurchaseAssetKingdomSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Choose asset kingdom/land location", min_values=1, max_values=1, options=options)
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, PurchaseAssetView):
+            view.location_kingdom = str(self.values[0])
+            await view.rebuild(interaction, "Asset location selected.")
 
 
 class PurchaseAssetTypeSelect(discord.ui.Select):
@@ -3285,7 +3582,7 @@ async def purchase_asset(interaction: discord.Interaction):
         await interaction.followup.send("No asset definitions are available yet. Ask staff to check `/econ-schema-status` after redeploy.", ephemeral=True)
         return
     view = PurchaseAssetView(interaction.user.id, characters, asset_types)
-    embed = discord.Embed(title="Purchase Asset", description="Choose one of your characters, an asset type, and a tier name. After you name the asset, staff will receive an approval request.", color=discord.Color.gold())
+    embed = discord.Embed(title="Purchase Asset", description="Choose one of your characters, the asset's kingdom/land location, an asset type, and a tier name. After you name the asset, staff will receive an approval request.", color=discord.Color.gold())
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
