@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v030"
+APP_VERSION = "Alaris_EconomyBot_v031"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -1922,16 +1922,14 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
     """
     with db_connect() as conn:
         with conn.cursor() as cur:
+            # Lock only the owned econ.assets row. PostgreSQL does not allow
+            # FOR UPDATE to be applied across the nullable side of an outer join,
+            # so character metadata is fetched separately after the asset lock.
             cur.execute(
                 """
-                SELECT a.*,
-                       COALESCE(c.name, ac.name) AS character_name,
-                       COALESCE(c.user_id, ac.user_id) AS user_id,
-                       COALESCE(c.kingdom, ac.kingdom) AS character_kingdom
-                FROM econ.assets a
-                LEFT JOIN public.characters c ON c.guild_id = a.guild_id AND c.character_id = a.character_id
-                LEFT JOIN public.alaris_characters ac ON ac.guild_id = a.guild_id AND ac.id = a.character_id
-                WHERE a.guild_id = %s AND a.character_id = %s AND a.id = %s
+                SELECT *
+                FROM econ.assets
+                WHERE guild_id = %s AND character_id = %s AND id = %s
                 FOR UPDATE;
                 """,
                 (guild_id, character_id, asset_id),
@@ -1941,6 +1939,36 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
                 conn.rollback()
                 return {"ok": False, "reason": "asset_not_found"}
             asset = dict(asset)
+
+            cur.execute(
+                """
+                SELECT name, user_id, kingdom
+                FROM public.characters
+                WHERE guild_id = %s AND character_id = %s AND archived = FALSE
+                LIMIT 1;
+                """,
+                (guild_id, character_id),
+            )
+            char_row = cur.fetchone()
+            if not char_row:
+                cur.execute(
+                    """
+                    SELECT name, user_id, kingdom
+                    FROM public.alaris_characters
+                    WHERE guild_id = %s AND id = %s AND COALESCE(status, 'active') = 'active'
+                    LIMIT 1;
+                    """,
+                    (guild_id, character_id),
+                )
+                char_row = cur.fetchone()
+            if not char_row:
+                conn.rollback()
+                return {"ok": False, "reason": "character_not_found"}
+            char_row = dict(char_row)
+            asset["character_name"] = char_row.get("name")
+            asset["user_id"] = char_row.get("user_id")
+            asset["character_kingdom"] = char_row.get("kingdom")
+
             if int(asset.get("user_id") or 0) != int(actor_user_id):
                 conn.rollback()
                 return {"ok": False, "reason": "not_owner"}
