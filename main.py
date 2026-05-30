@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v033"
+APP_VERSION = "Alaris_EconomyBot_v034"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -228,42 +228,23 @@ INCOME_REMINDER_ROLE_ID = _get_int_env("INCOME_REMINDER_ROLE_ID", 15053254571120
 INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 12) or 12
 INCOME_REMINDER_MINUTE = _get_int_env("INCOME_REMINDER_MINUTE", 30) or 30
 INCOME_REMINDER_REACTION = os.getenv("INCOME_REMINDER_REACTION", "🪙")
-GOOSEHONK_EMOJI_ID = 1147030043462217750
-GOOSEHONK_EMOJI_FALLBACK = "<a:goosehonk:1147030043462217750>"
-
-
-def income_reminder_goosehonk_token() -> str:
-    """Return the exact custom emoji token Discord should render.
-
-    Discord will not render :goosehonk: from bot messages. It must receive the
-    custom emoji token. Prefer the live emoji object because str(emoji) uses the
-    exact current name/id/animation metadata known to Discord. If the bot cannot
-    see the emoji, fall back to the known token and log a warning so permissions
-    or server availability can be fixed.
-    """
-    try:
-        emoji = client.get_emoji(GOOSEHONK_EMOJI_ID)
-    except Exception:
-        emoji = None
-    if emoji is not None:
-        return str(emoji)
-    print(f"[warn] Goosehonk emoji id {GOOSEHONK_EMOJI_ID} is not visible to the bot; using fallback token {GOOSEHONK_EMOJI_FALLBACK}.")
-    return GOOSEHONK_EMOJI_FALLBACK
+INCOME_REMINDER_GOING_TEXT = (
+    f"🪿 <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** 🪿\n\n"
+    "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
+    "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙\n\n"
+    f"React with {INCOME_REMINDER_REACTION} to get daily income reminders."
+)
 
 
 def build_income_reminder_text() -> str:
-    """Build the daily income reminder at send-time.
+    """Return the daily income reminder text.
 
-    This intentionally ignores INCOME_REMINDER_TEXT env overrides so stale
-    Railway values like :goosehonk: cannot leak into the posted message.
+    v034 deliberately uses only standard Unicode emojis, including the Unicode
+    goose emoji (🪿). It does not read INCOME_REMINDER_TEXT or custom emoji IDs,
+    so stale Railway env values and unavailable server custom emojis cannot
+    render as literal :emoji: text.
     """
-    goose = income_reminder_goosehonk_token()
-    return (
-        f"{goose} <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** {goose}\n\n"
-        "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
-        "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙\n\n"
-        f"React with {INCOME_REMINDER_REACTION} to get daily income reminders."
-    )
+    return INCOME_REMINDER_GOING_TEXT
 
 
 _income_reminder_task: Optional[asyncio.Task] = None
@@ -4141,7 +4122,7 @@ async def on_ready():
     if _income_reminder_task is None or _income_reminder_task.done():
         _income_reminder_task = asyncio.create_task(income_reminder_loop())
         print(f"[startup] Daily income reminder scheduled for {INCOME_REMINDER_HOUR:02d}:{INCOME_REMINDER_MINUTE:02d} America/Chicago; channel={INCOME_REMINDER_CHANNEL_ID or 'disabled'}")
-        print(f"[startup] Income reminder goosehonk fallback token: {GOOSEHONK_EMOJI_FALLBACK}")
+        print("[startup] Income reminder uses Unicode goose emoji; no custom emoji dependency.")
 
 
 def main():
