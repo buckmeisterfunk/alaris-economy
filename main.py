@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v032"
+APP_VERSION = "Alaris_EconomyBot_v033"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -3343,12 +3343,70 @@ class AssetDenyReasonModal(discord.ui.Modal, title="Deny Asset Request"):
         await interaction.followup.send(f"Denied asset request #{self.request_id}: {reason_text}", ephemeral=True)
 
 class AssetApprovalView(discord.ui.View):
+    """Persistent approval view for economy asset requests.
+
+    v033: buttons use deterministic custom_id values and the bot re-registers
+    pending request views on startup. This lets approval embeds survive Railway
+    redeploys/restarts instead of producing Discord's generic "interaction failed".
+    """
+
     def __init__(self, request_id: int):
         super().__init__(timeout=None)
         self.request_id = int(request_id)
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        accept_button = discord.ui.Button(
+            label="Accept",
+            style=discord.ButtonStyle.success,
+            custom_id=f"econ_asset_request_accept:{self.request_id}",
+        )
+        accept_button.callback = self.accept_callback
+        self.add_item(accept_button)
+
+        deny_button = discord.ui.Button(
+            label="Deny",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"econ_asset_request_deny:{self.request_id}",
+        )
+        deny_button.callback = self.deny_callback
+        self.add_item(deny_button)
+
+    async def accept_callback(self, interaction: discord.Interaction):
+        try:
+            await self._accept(interaction)
+        except Exception as exc:
+            print(f"[ERROR] Asset approval button failed for request {self.request_id}: {exc}")
+            traceback.print_exc()
+            try:
+                msg = (
+                    f"Asset approval button failed for request #{self.request_id}. "
+                    f"Use `/econ-asset-request-action` as a fallback and check Railway logs."
+                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+    async def deny_callback(self, interaction: discord.Interaction):
+        try:
+            await self._deny(interaction)
+        except Exception as exc:
+            print(f"[ERROR] Asset deny button failed for request {self.request_id}: {exc}")
+            traceback.print_exc()
+            try:
+                msg = (
+                    f"Asset deny button failed for request #{self.request_id}. "
+                    f"Use `/econ-asset-request-action` as a fallback and check Railway logs."
+                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+    async def _accept(self, interaction: discord.Interaction):
         if not await is_staff(interaction):
             await interaction.response.send_message("Only staff may approve economy asset requests.", ephemeral=True)
             return
@@ -3382,18 +3440,17 @@ class AssetApprovalView(discord.ui.View):
         )
         fresh = await run_db(fetch_asset_request_sync, guild_id, self.request_id)
         if fresh and interaction.message:
-            for child in self.children:
+            disabled = AssetApprovalView(self.request_id)
+            for child in disabled.children:
                 child.disabled = True
-            await interaction.message.edit(embed=build_asset_request_embed(fresh, ref.name if ref else None), view=self)
+            await interaction.message.edit(embed=build_asset_request_embed(fresh, ref.name if ref else None), view=disabled)
         await interaction.followup.send(f"Approved asset request #{self.request_id}.", ephemeral=True)
 
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _deny(self, interaction: discord.Interaction):
         if not await is_staff(interaction):
             await interaction.response.send_message("Only staff may deny economy asset requests.", ephemeral=True)
             return
         await interaction.response.send_modal(AssetDenyReasonModal(self.request_id))
-
 
 async def post_asset_request_to_staff_channel(guild_id: int, request_id: int, character_name: str):
     if not ASSET_REQUEST_CHANNEL_ID:
@@ -3868,8 +3925,25 @@ async def econ_asset_request_action(interaction: discord.Interaction, request_id
     if not result.get("ok"):
         await interaction.followup.send(f"Could not apply action: `{clean_text(result.get('reason'))}`.", ephemeral=True)
         return
+    req = result.get("request") or await run_db(fetch_asset_request_sync, guild_id, int(request_id))
+    if action.value == "approve":
+        await log_to_channel("asset_request_approved", [f"Request ID: **{request_id}**", f"Approved by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)"])
     if action.value == "deny":
         await log_to_channel("asset_request_denied", [f"Request ID: **{request_id}**", f"Denied by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)", f"Reason: {reason_clean}"])
+    # Best-effort edit of the original request message when the fallback command is used.
+    try:
+        fresh = await run_db(fetch_asset_request_sync, guild_id, int(request_id))
+        if fresh and fresh.get("request_channel_id") and fresh.get("request_message_id"):
+            channel = client.get_channel(int(fresh["request_channel_id"])) or await client.fetch_channel(int(fresh["request_channel_id"]))
+            if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                msg = await channel.fetch_message(int(fresh["request_message_id"]))
+                disabled = AssetApprovalView(int(request_id))
+                for child in disabled.children:
+                    child.disabled = True
+                ref = await run_db(fetch_character_by_id_sync, guild_id, int(fresh["character_id"]))
+                await msg.edit(embed=build_asset_request_embed(fresh, ref.name if ref else fresh.get("character_name")), view=disabled)
+    except Exception as exc:
+        print(f"[warn] Could not edit asset request #{request_id} message after fallback action: {exc}")
     await interaction.followup.send(f"Request #{request_id} marked `{action.value}`." + (f" Reason: {reason_clean}" if reason_clean and action.value == "deny" else ""), ephemeral=True)
 
 
@@ -3989,6 +4063,57 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         traceback.print_exc()
 
 
+
+async def register_pending_asset_approval_views() -> None:
+    """Re-register persistent asset approval buttons for pending request embeds.
+
+    Discord persistent component callbacks are not restored automatically after a
+    process restart unless the bot registers the same view/custom_ids again.
+    This startup pass also best-effort edits stored pending request messages so
+    older embeds receive the v033 deterministic button custom_ids.
+    """
+    try:
+        rows = await run_db(fetch_pending_asset_requests_sync, int(GUILD_ID))
+    except Exception as exc:
+        print(f"[warn] Could not fetch pending asset requests for persistent views: {exc}")
+        traceback.print_exc()
+        return
+
+    registered = 0
+    refreshed = 0
+    for row in rows:
+        try:
+            req_id = int(row.get("id") or 0)
+            if req_id <= 0:
+                continue
+            view = AssetApprovalView(req_id)
+            message_id = row.get("request_message_id")
+            if message_id:
+                client.add_view(view, message_id=int(message_id))
+                registered += 1
+            else:
+                client.add_view(view)
+                registered += 1
+
+            channel_id = row.get("request_channel_id")
+            if channel_id and message_id:
+                try:
+                    channel = client.get_channel(int(channel_id)) or await client.fetch_channel(int(channel_id))
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        msg = await channel.fetch_message(int(message_id))
+                        await msg.edit(embed=build_asset_request_embed(row, row.get("character_name")), view=AssetApprovalView(req_id))
+                        refreshed += 1
+                except discord.Forbidden as exc:
+                    print(f"[warn] Missing access refreshing asset request #{req_id} message view: {exc}")
+                except discord.NotFound:
+                    print(f"[warn] Stored asset request #{req_id} message was not found while refreshing persistent view.")
+                except Exception as exc:
+                    print(f"[warn] Could not refresh asset request #{req_id} message view: {exc}")
+        except Exception as exc:
+            print(f"[warn] Could not register persistent view for asset request row {row.get('id')}: {exc}")
+            traceback.print_exc()
+    print(f"[startup] Registered persistent asset approval views: {registered}; refreshed request messages: {refreshed}.")
+
 @client.event
 async def on_ready():
     global _income_reminder_task
@@ -3999,6 +4124,7 @@ async def on_ready():
         print("[startup] Economy schema ensured.")
         sync_result = await run_db(sync_public_characters_from_alaris_sync, GUILD_ID)
         print(f"[startup] Character sync result: {sync_result}")
+        await register_pending_asset_approval_views()
     except Exception as exc:
         print(f"[startup][ERROR] ensure_schema failed: {exc}")
         traceback.print_exc()
