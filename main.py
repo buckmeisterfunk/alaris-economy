@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v031"
+APP_VERSION = "Alaris_EconomyBot_v032"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -228,40 +228,44 @@ INCOME_REMINDER_ROLE_ID = _get_int_env("INCOME_REMINDER_ROLE_ID", 15053254571120
 INCOME_REMINDER_HOUR = _get_int_env("INCOME_REMINDER_HOUR", 12) or 12
 INCOME_REMINDER_MINUTE = _get_int_env("INCOME_REMINDER_MINUTE", 30) or 30
 INCOME_REMINDER_REACTION = os.getenv("INCOME_REMINDER_REACTION", "🪙")
-GOOSEHONK_EMOJI = "<a:goosehonk:1147030043462217750>"
+GOOSEHONK_EMOJI_ID = 1147030043462217750
+GOOSEHONK_EMOJI_FALLBACK = "<a:goosehonk:1147030043462217750>"
 
 
-def normalize_income_reminder_text(raw: Optional[str]) -> str:
-    """Build/sanitize the daily income reminder text.
+def income_reminder_goosehonk_token() -> str:
+    """Return the exact custom emoji token Discord should render.
 
-    Discord custom emojis do not render from :emoji_name: aliases in bot-sent
-    messages. They must be sent as <:name:id> or <a:name:id>. This sanitizer
-    protects us even if Railway still has an older INCOME_REMINDER_TEXT env var
-    containing :goosehonk: or an escaped custom emoji copied from Discord.
+    Discord will not render :goosehonk: from bot messages. It must receive the
+    custom emoji token. Prefer the live emoji object because str(emoji) uses the
+    exact current name/id/animation metadata known to Discord. If the bot cannot
+    see the emoji, fall back to the known token and log a warning so permissions
+    or server availability can be fixed.
     """
-    fallback = (
-        f"{GOOSEHONK_EMOJI} <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** {GOOSEHONK_EMOJI}\n\n"
+    try:
+        emoji = client.get_emoji(GOOSEHONK_EMOJI_ID)
+    except Exception:
+        emoji = None
+    if emoji is not None:
+        return str(emoji)
+    print(f"[warn] Goosehonk emoji id {GOOSEHONK_EMOJI_ID} is not visible to the bot; using fallback token {GOOSEHONK_EMOJI_FALLBACK}.")
+    return GOOSEHONK_EMOJI_FALLBACK
+
+
+def build_income_reminder_text() -> str:
+    """Build the daily income reminder at send-time.
+
+    This intentionally ignores INCOME_REMINDER_TEXT env overrides so stale
+    Railway values like :goosehonk: cannot leak into the posted message.
+    """
+    goose = income_reminder_goosehonk_token()
+    return (
+        f"{goose} <@&{INCOME_REMINDER_ROLE_ID}>: **Get That Bread!** {goose}\n\n"
         "🪙 Don’t forget to claim your daily income for all registered characters using /income\n\n"
         "Invest wisely! Use /purchase-asset when you’re ready to buy your character’s first business and start your trade empire! 🪙\n\n"
         f"React with {INCOME_REMINDER_REACTION} to get daily income reminders."
     )
-    text = (raw or fallback).strip()
-    # Fix older/env-configured reminder text that used Discord's typed alias.
-    text = text.replace(":goosehonk:", GOOSEHONK_EMOJI)
-    # Fix escaped custom emoji strings copied using a leading backslash.
-    text = text.replace(r"\<a:goosehonk:1147030043462217750>", GOOSEHONK_EMOJI)
-    text = text.replace(r"\<:goosehonk:1147030043462217750>", GOOSEHONK_EMOJI)
-    # Fix a non-animated variant if it was accidentally used.
-    text = text.replace("<:goosehonk:1147030043462217750>", GOOSEHONK_EMOJI)
-    if f"React with {INCOME_REMINDER_REACTION}" not in text:
-        text = text.rstrip() + f"\n\nReact with {INCOME_REMINDER_REACTION} to get daily income reminders."
-    return text
 
 
-# v029: hard-code the reminder body from code so stale Railway INCOME_REMINDER_TEXT
-# values cannot reintroduce literal :goosehonk: aliases. Discord custom
-# emojis must be sent with the full <a:name:id> syntax to render.
-INCOME_REMINDER_TEXT = normalize_income_reminder_text(None)
 _income_reminder_task: Optional[asyncio.Task] = None
 
 if not DISCORD_TOKEN:
@@ -2331,8 +2335,10 @@ async def post_income_reminder_once() -> bool:
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             print(f"[warn] Income reminder target is not a text channel/thread: {INCOME_REMINDER_CHANNEL_ID}")
             return False
+        reminder_text = build_income_reminder_text()
+        print(f"[startup] Income reminder outgoing text repr: {reminder_text!r}")
         msg = await channel.send(
-            INCOME_REMINDER_TEXT[:1900],
+            reminder_text[:1900],
             allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
         )
         try:
@@ -4009,7 +4015,7 @@ async def on_ready():
     if _income_reminder_task is None or _income_reminder_task.done():
         _income_reminder_task = asyncio.create_task(income_reminder_loop())
         print(f"[startup] Daily income reminder scheduled for {INCOME_REMINDER_HOUR:02d}:{INCOME_REMINDER_MINUTE:02d} America/Chicago; channel={INCOME_REMINDER_CHANNEL_ID or 'disabled'}")
-        print(f"[startup] Income reminder emoji token: {GOOSEHONK_EMOJI}")
+        print(f"[startup] Income reminder goosehonk fallback token: {GOOSEHONK_EMOJI_FALLBACK}")
 
 
 def main():
