@@ -1,7 +1,7 @@
-# Alaris_EconomyBot_v026
+# Alaris_EconomyBot_v035
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
-# v026: Adds income reminder reaction-role support. Daily reminder posts include a coin reaction players can click to claim the reminder role. Preserves psycopg-only dependency mode, v024 fixed 12:30 PM America/Chicago reminder, owner-only transfer source autocomplete, and income claim messaging.
+# v035: Fixes enchantment rank detection so tier labels such as "(1) Warding +1" are read as rank 1 rather than 11. Preserves all v034 behavior.
 # Safety rules:
 # - Additive schema only.
 # - No wipe/reset/destructive commands.
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v034"
+APP_VERSION = "Alaris_EconomyBot_v035"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -1519,18 +1519,28 @@ def count_settlement_assets_sync(guild_id: int, character_id: int) -> int:
 def current_enchantment_rank_sync(guild_id: int, character_id: int, asset_type: str) -> int:
     if not is_enchantment_asset_type(asset_type):
         return 0
+
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT COALESCE(MAX(NULLIF(regexp_replace(COALESCE(tier_code,''), '[^0-9]', '', 'g'), '')::integer), 0) AS rank
+                SELECT tier_code
                 FROM econ.assets
-                WHERE guild_id = %s AND character_id = %s AND asset_type = %s;
+                WHERE guild_id = %s
+                  AND character_id = %s
+                  AND asset_type = %s;
                 """,
                 (guild_id, character_id, asset_type),
             )
-            row = cur.fetchone() or {}
-            return int(row.get("rank") or 0)
+            rows = cur.fetchall()
+
+    ranks: list[int] = []
+    for row in rows:
+        rank = tier_rank(row.get("tier_code"))
+        if rank is not None:
+            ranks.append(rank)
+
+    return max(ranks, default=0)
 
 
 def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], current_prestige: int, *, is_new_purchase: bool, guild_id: int, character_id: int) -> Optional[str]:
