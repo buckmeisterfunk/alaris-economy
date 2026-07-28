@@ -1907,6 +1907,77 @@ def asset_current_value_sync(asset: dict[str, Any]) -> int:
     return max(0, int(value or 0))
 
 
+
+def rename_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_id: int, new_name: str) -> dict[str, Any]:
+    clean_name = clean_text(new_name)[:80]
+    if not clean_name:
+        return {"ok": False, "reason": "blank_name"}
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.*, COALESCE(c.user_id, ac.user_id) AS owner_user_id,
+                       COALESCE(c.name, ac.name) AS character_name
+                FROM econ.assets a
+                LEFT JOIN public.characters c
+                  ON c.guild_id=a.guild_id AND c.character_id=a.character_id
+                LEFT JOIN public.alaris_characters ac
+                  ON ac.guild_id=a.guild_id AND ac.id=a.character_id
+                WHERE a.guild_id=%s AND a.character_id=%s AND a.id=%s
+                LIMIT 1
+                FOR UPDATE OF a;
+                """,
+                (guild_id, character_id, asset_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return {"ok": False, "reason": "asset_not_found"}
+            asset = dict(row)
+            if int(asset.get("owner_user_id") or 0) != int(actor_user_id):
+                conn.rollback()
+                return {"ok": False, "reason": "not_owner"}
+            if str(asset.get("asset_type") or "") not in ENCHANTMENT_ASSET_TYPES:
+                conn.rollback()
+                return {"ok": False, "reason": "only_enchantments_renameable"}
+            cur.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM econ.assets
+                    WHERE guild_id=%s AND character_id=%s AND asset_type=%s
+                      AND asset_name=%s AND id<>%s
+                ) AS exists;
+                """,
+                (guild_id, character_id, asset.get("asset_type"), clean_name, asset_id),
+            )
+            if bool(cur.fetchone()["exists"]):
+                conn.rollback()
+                return {"ok": False, "reason": "duplicate_name"}
+            old_name = str(asset.get("asset_name") or "")
+            cur.execute(
+                """
+                UPDATE econ.assets
+                SET asset_name=%s, updated_at=NOW()
+                WHERE guild_id=%s AND character_id=%s AND id=%s;
+                """,
+                (clean_name, guild_id, character_id, asset_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO econ.transactions (guild_id, character_id, actor_user_id, action, amount_embers, details_json)
+                VALUES (%s,%s,%s,'asset_renamed',0,%s::jsonb);
+                """,
+                (guild_id, character_id, actor_user_id, json.dumps({
+                    "asset_id": asset_id,
+                    "asset_type": asset.get("asset_type"),
+                    "old_name": old_name,
+                    "new_name": clean_name,
+                })),
+            )
+        conn.commit()
+    queue_character_refresh_sync(guild_id, character_id, "asset_renamed")
+    return {"ok": True, "old_name": old_name, "new_name": clean_name, "asset": asset}
+
 def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_id: int) -> dict[str, Any]:
     """Sell an owned asset immediately.
 
@@ -2870,6 +2941,155 @@ async def econ_transfer(interaction: discord.Interaction, source_character: str,
         ephemeral=True,
     )
 
+
+
+class RenameAssetModal(discord.ui.Modal, title="Rename Enchanted Item"):
+    new_name = discord.ui.TextInput(
+        label="New item name",
+        placeholder="Example: Dawnward Blade",
+        min_length=1,
+        max_length=80,
+    )
+
+    def __init__(self, character_id: int, asset_id: int):
+        super().__init__()
+        self.character_id = int(character_id)
+        self.asset_id = int(asset_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild_id = int(interaction.guild_id or GUILD_ID)
+        result = await run_db(
+            rename_asset_sync,
+            guild_id,
+            self.character_id,
+            self.asset_id,
+            int(interaction.user.id),
+            str(self.new_name.value),
+        )
+        if not result.get("ok"):
+            reason = clean_text(result.get("reason") or "unknown")
+            await interaction.followup.send(f"The item could not be renamed: `{reason}`.", ephemeral=True)
+            return
+        await log_to_channel(
+            "asset_renamed",
+            [
+                f"Character ID: **{self.character_id}**",
+                f"Old name: **{clean_text(result.get('old_name'))}**",
+                f"New name: **{clean_text(result.get('new_name'))}**",
+                f"Renamed by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
+            ],
+        )
+        await interaction.followup.send(
+            f"Renamed **{clean_text(result.get('old_name'))}** to **{clean_text(result.get('new_name'))}**.",
+            ephemeral=True,
+        )
+
+
+class RenameAssetView(discord.ui.View):
+    def __init__(self, owner_id: int, characters: list[dict[str, Any]]):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.characters = characters
+        self.character_id: Optional[int] = None
+        self.asset_id: Optional[int] = None
+        self.refresh_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("Only the player who opened this rename flow may use it.", ephemeral=True)
+            return False
+        return True
+
+    def refresh_items(self):
+        self.clear_items()
+        options = [
+            discord.SelectOption(
+                label=clean_text(c.get("name"))[:100],
+                value=str(c["character_id"]),
+                description=(clean_text(c.get("kingdom")) or "No kingdom assigned")[:100],
+                default=(self.character_id == int(c["character_id"])),
+            )
+            for c in self.characters[:25]
+        ]
+        if options:
+            self.add_item(RenameAssetCharacterSelect(options))
+        button = discord.ui.Button(label="Rename Selected Item", style=discord.ButtonStyle.primary, disabled=not (self.character_id and self.asset_id))
+        async def button_cb(interaction: discord.Interaction):
+            if not (self.character_id and self.asset_id):
+                await interaction.response.send_message("Choose a character and enchanted item first.", ephemeral=True)
+                return
+            await interaction.response.send_modal(RenameAssetModal(self.character_id, self.asset_id))
+        button.callback = button_cb
+        self.add_item(button)
+
+    async def rebuild(self, interaction: discord.Interaction, status: str = ""):
+        self.refresh_items()
+        if self.character_id:
+            assets = await run_db(fetch_owned_assets_for_upgrade_sync, int(interaction.guild_id or GUILD_ID), self.character_id)
+            enchantments = [a for a in assets if str(a.get("asset_type") or "") in ENCHANTMENT_ASSET_TYPES]
+            if enchantments:
+                options = [
+                    discord.SelectOption(
+                        label=f"{clean_text(a.get('asset_name'))} — {clean_text(a.get('tier_code'))}"[:100],
+                        value=str(a["id"]),
+                        description=clean_text(a.get("asset_type"))[:100],
+                        default=(self.asset_id == int(a["id"])),
+                    )
+                    for a in enchantments[:25]
+                ]
+                button = self.children[-1]
+                self.remove_item(button)
+                self.add_item(RenameOwnedAssetSelect(options))
+                self.add_item(button)
+        embed = discord.Embed(
+            title="Rename Enchanted Item",
+            description="Choose one of your characters, then choose an owned enchantment and give it a new item name.",
+            color=discord.Color.blurple(),
+        )
+        if status:
+            embed.add_field(name="Status", value=status[:1024], inline=False)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+class RenameAssetCharacterSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Choose one of your characters", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, RenameAssetView):
+            view.character_id = int(self.values[0])
+            view.asset_id = None
+            await view.rebuild(interaction, "Character selected. Now choose an enchanted item.")
+
+
+class RenameOwnedAssetSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Choose an enchanted item", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, RenameAssetView):
+            view.asset_id = int(self.values[0])
+            await view.rebuild(interaction, "Item selected. Press Rename Selected Item.")
+
+
+@tree.command(name="rename-asset", description="Rename one of your character's enchanted items.", guild=discord.Object(id=GUILD_ID))
+async def rename_asset(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild_id = int(interaction.guild_id or GUILD_ID)
+    characters = await run_db(fetch_owned_characters_sync, guild_id, int(interaction.user.id))
+    if not characters:
+        await interaction.followup.send("You do not have any active synced Alaris characters.", ephemeral=True)
+        return
+    view = RenameAssetView(interaction.user.id, characters)
+    embed = discord.Embed(
+        title="Rename Enchanted Item",
+        description="Choose one of your characters, then choose an owned enchantment and give it a new item name.",
+        color=discord.Color.blurple(),
+    )
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 class SellAssetView(discord.ui.View):
