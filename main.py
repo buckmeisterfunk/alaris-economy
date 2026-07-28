@@ -437,6 +437,7 @@ def ensure_schema_sync() -> None:
                     noble_title_option TEXT,
                     noble_realm_name TEXT,
                     income_embers BIGINT NOT NULL DEFAULT 0,
+                    acquisition_value_embers BIGINT,
                     created_by_user_id BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -444,6 +445,7 @@ def ensure_schema_sync() -> None:
                 );
                 """
             )
+            cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS acquisition_value_embers BIGINT;")
 
             cur.execute(
                 """
@@ -1543,7 +1545,7 @@ def current_enchantment_rank_sync(guild_id: int, character_id: int, asset_type: 
     return max(ranks, default=0)
 
 
-def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], current_prestige: int, *, is_new_purchase: bool, guild_id: int, character_id: int) -> Optional[str]:
+def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], current_prestige: int, *, is_new_purchase: bool, guild_id: int, character_id: int, asset_id: Optional[int] = None) -> Optional[str]:
     asset_type = str(asset_type or "").strip()
     tier = tier_rank(target_tier_code) or 0
 
@@ -1577,17 +1579,18 @@ def prestige_gate_message_for(asset_type: str, target_tier_code: Optional[str], 
             return "Keep/Castle holdings require Prestige Tier 1."
 
     if is_enchantment_asset_type(asset_type):
-        current_rank = current_enchantment_rank_sync(guild_id, character_id, asset_type)
         if is_new_purchase:
-            if current_rank > 0:
-                return "This character already has that enchantment track. Use /upgrade-asset to improve it."
             if tier != 1:
-                return "Enchantments must be purchased sequentially. Purchase +1 first, then upgrade one rank at a time."
+                return "Each enchanted item must begin at +1 and then be upgraded one rank at a time."
         else:
-            if current_rank <= 0:
-                return "This character does not own that enchantment track yet. Purchase +1 first."
+            asset = fetch_asset_by_id_sync(guild_id, int(asset_id or 0)) if asset_id else None
+            current_rank = tier_rank(asset.get("tier_code")) if asset else None
+            if not asset or int(asset.get("character_id") or 0) != int(character_id):
+                return "The selected enchanted item could not be found."
+            if current_rank is None:
+                return "The selected enchanted item has an invalid rank."
             if tier != current_rank + 1:
-                return f"Enchantments must upgrade one rank at a time. Current rank is +{current_rank}; next valid upgrade is +{current_rank + 1}."
+                return f"Enchantments must upgrade one rank at a time. This item is currently +{current_rank}; its next valid upgrade is +{current_rank + 1}."
 
     return None
 
@@ -1597,7 +1600,7 @@ def fetch_owned_assets_for_upgrade_sync(guild_id: int, character_id: int) -> lis
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name, combat_bonus_type, combat_bonus_value, combat_bonus_scope
+                SELECT id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name, combat_bonus_type, combat_bonus_value, combat_bonus_scope, acquisition_value_embers
                 FROM econ.assets
                 WHERE guild_id = %s
                   AND character_id = %s
@@ -1614,7 +1617,7 @@ def fetch_asset_by_id_sync(guild_id: int, asset_id: int) -> Optional[dict[str, A
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, guild_id, character_id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name
+                SELECT id, guild_id, character_id, asset_type, tier_code, asset_name, kingdom, income_embers, prestige_tier, title_style, display_title, domain_name, acquisition_value_embers
                 FROM econ.assets
                 WHERE guild_id = %s AND id = %s
                 LIMIT 1;
@@ -1805,10 +1808,14 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                         combat_bonus_type = %s,
                         combat_bonus_value = %s,
                         combat_bonus_scope = %s,
+                        acquisition_value_embers = CASE
+                            WHEN acquisition_value_embers IS NULL THEN NULL
+                            ELSE acquisition_value_embers + %s
+                        END,
                         updated_at = NOW()
                     WHERE guild_id = %s AND id = %s;
                     """,
-                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope"), guild_id, asset_id),
+                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope"), cost, guild_id, asset_id),
                 )
             else:
                 conn.rollback()
@@ -1903,6 +1910,9 @@ def asset_current_value_sync(asset: dict[str, Any]) -> int:
     tier_code = str(asset.get("tier_code") or "").strip()
     if not asset_type or not tier_code:
         return 0
+    explicit_basis = asset.get("acquisition_value_embers")
+    if explicit_basis is not None:
+        return max(0, int(explicit_basis or 0))
     value = cumulative_cost_to_tier_sync(asset_type, tier_code)
     return max(0, int(value or 0))
 
@@ -1944,11 +1954,11 @@ def rename_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_use
                 """
                 SELECT EXISTS(
                     SELECT 1 FROM econ.assets
-                    WHERE guild_id=%s AND character_id=%s AND asset_type=%s
-                      AND asset_name=%s AND id<>%s
+                    WHERE guild_id=%s AND character_id=%s
+                      AND lower(asset_name)=lower(%s) AND id<>%s
                 ) AS exists;
                 """,
-                (guild_id, character_id, asset.get("asset_type"), clean_name, asset_id),
+                (guild_id, character_id, clean_name, asset_id),
             )
             if bool(cur.fetchone()["exists"]):
                 conn.rollback()
@@ -2969,7 +2979,14 @@ class RenameAssetModal(discord.ui.Modal, title="Rename Enchanted Item"):
         )
         if not result.get("ok"):
             reason = clean_text(result.get("reason") or "unknown")
-            await interaction.followup.send(f"The item could not be renamed: `{reason}`.", ephemeral=True)
+            messages = {
+                "blank_name": "Enter a name for the enchanted item.",
+                "asset_not_found": "That enchanted item could not be found.",
+                "not_owner": "You do not own that enchanted item.",
+                "only_enchantments_renameable": "Only enchanted items can be renamed with this command.",
+                "duplicate_name": "That character already owns an asset with that name.",
+            }
+            await interaction.followup.send(messages.get(reason, "The enchanted item could not be renamed."), ephemeral=True)
             return
         await log_to_channel(
             "asset_renamed",
@@ -3075,7 +3092,7 @@ class RenameOwnedAssetSelect(discord.ui.Select):
             await view.rebuild(interaction, "Item selected. Press Rename Selected Item.")
 
 
-@tree.command(name="rename-asset", description="Rename one of your character's enchanted items.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="rename-enchanted-item", description="Rename one of your character's enchanted items.", guild=discord.Object(id=GUILD_ID))
 async def rename_asset(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild_id = int(interaction.guild_id or GUILD_ID)
@@ -3966,7 +3983,7 @@ class UpgradeAssetView(discord.ui.View):
             await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
             return
         current_prestige = await run_db(max_prestige_tier_sync, guild_id, ref.character_id)
-        gate_msg = await run_db(prestige_gate_message_for, asset["asset_type"], self.target_tier, current_prestige, is_new_purchase=False, guild_id=guild_id, character_id=ref.character_id)
+        gate_msg = await run_db(prestige_gate_message_for, asset["asset_type"], self.target_tier, current_prestige, is_new_purchase=False, guild_id=guild_id, character_id=ref.character_id, asset_id=int(asset["id"]))
         if gate_msg:
             await interaction.followup.send(gate_msg, ephemeral=True)
             return
