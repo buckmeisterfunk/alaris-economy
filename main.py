@@ -1,6 +1,7 @@
-# Alaris_EconomyBot_v038
+# Alaris_EconomyBot_v039
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
+# v039: Enforces a 40% minimum enchantment-sale withholding with correct high-tax accounting, universal normalized asset names, any-asset rename confirmations, and paginated asset menus.
 # v038: Allows every owned asset to be renamed; enforces item-specific enchantment upgrades and normalized names; applies normal cumulative resale value plus kingdom tax and a 30% magical-regulation fee to enchantment sales.
 # v035: Fixes enchantment rank detection so tier labels such as "(1) Warding +1" are read as rank 1 rather than 11. Preserves all v034 behavior.
 # Safety rules:
@@ -32,7 +33,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v038"
+APP_VERSION = "Alaris_EconomyBot_v039"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -448,6 +449,31 @@ def ensure_schema_sync() -> None:
                 """
             )
             cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS acquisition_value_embers BIGINT;")
+            # v039: Normalize any legacy case-insensitive duplicate names before enforcing
+            # one player-facing asset name per character across every asset type.
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT id, asset_name,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY guild_id, character_id, lower(asset_name)
+                               ORDER BY id
+                           ) AS rn
+                    FROM econ.assets
+                )
+                UPDATE econ.assets a
+                   SET asset_name = LEFT(r.asset_name, 70) || ' (' || r.rn::text || ')',
+                       updated_at = NOW()
+                  FROM ranked r
+                 WHERE a.id = r.id AND r.rn > 1;
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS econ_assets_character_name_ci_uidx
+                    ON econ.assets (guild_id, character_id, lower(asset_name));
+                """
+            )
 
             cur.execute(
                 """
@@ -2068,10 +2094,22 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
                 (guild_id, location),
             )
             tax_row = cur.fetchone()
-            tax_bp = int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP)
-            tax = calc_tax(gross, tax_bp)
-            magic_fee_bp = MAGIC_REGULATORY_FEE_BP if is_enchantment_asset_type(asset_type) else 0
-            magic_regulatory_fee = calc_tax(gross, magic_fee_bp) if magic_fee_bp else 0
+            tax_bp = max(0, int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP))
+            # Kingdom tax is credited to the treasury at the configured rate, capped
+            # at the gross sale value. Enchantments additionally lose a 30% magical
+            # regulatory fee, and total withholding can never be below 40%.
+            tax = min(gross, calc_tax(gross, tax_bp))
+            is_enchantment = is_enchantment_asset_type(asset_type)
+            magic_fee_bp = MAGIC_REGULATORY_FEE_BP if is_enchantment else 0
+            minimum_total_bp = 4000 if is_enchantment else tax_bp
+            target_total_withheld = min(
+                gross,
+                max(
+                    calc_tax(gross, minimum_total_bp),
+                    tax + (calc_tax(gross, magic_fee_bp) if magic_fee_bp else 0),
+                ),
+            )
+            magic_regulatory_fee = max(0, target_total_withheld - tax) if is_enchantment else 0
             total_withheld = min(gross, tax + magic_regulatory_fee)
             net = max(0, gross - total_withheld)
 
@@ -3009,10 +3047,21 @@ class RenameAssetModal(discord.ui.Modal, title="Rename Asset"):
                 f"Renamed by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
             ],
         )
-        await interaction.followup.send(
-            f"Renamed **{clean_text(result.get('old_name'))}** to **{clean_text(result.get('new_name'))}**.",
-            ephemeral=True,
+        success_embed = discord.Embed(
+            title="✅ Asset Renamed",
+            description=(
+                f"**{clean_text(result.get('old_name'))}** was successfully renamed to "
+                f"**{clean_text(result.get('new_name'))}**."
+            ),
+            color=discord.Color.green(),
         )
+        success_embed.set_footer(text="The character card refresh has been queued.")
+        await interaction.followup.send(embed=success_embed, ephemeral=True)
+        try:
+            if interaction.message:
+                await interaction.message.edit(embed=success_embed, view=None)
+        except Exception:
+            LOG.exception("Asset rename succeeded, but the original rename menu could not be updated")
 
 
 class RenameAssetView(discord.ui.View):
@@ -3022,6 +3071,7 @@ class RenameAssetView(discord.ui.View):
         self.characters = characters
         self.character_id: Optional[int] = None
         self.asset_id: Optional[int] = None
+        self.asset_page: int = 0
         self.refresh_items()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -3058,6 +3108,10 @@ class RenameAssetView(discord.ui.View):
             assets = await run_db(fetch_owned_assets_for_upgrade_sync, int(interaction.guild_id or GUILD_ID), self.character_id)
             renameable_assets = assets
             if renameable_assets:
+                page_count = max(1, (len(renameable_assets) + 24) // 25)
+                self.asset_page = max(0, min(self.asset_page, page_count - 1))
+                start = self.asset_page * 25
+                page_assets = renameable_assets[start:start + 25]
                 options = [
                     discord.SelectOption(
                         label=f"{clean_text(a.get('asset_name'))} — {clean_text(a.get('tier_code'))}"[:100],
@@ -3065,11 +3119,26 @@ class RenameAssetView(discord.ui.View):
                         description=clean_text(a.get("asset_type"))[:100],
                         default=(self.asset_id == int(a["id"])),
                     )
-                    for a in renameable_assets[:25]
+                    for a in page_assets
                 ]
                 button = self.children[-1]
                 self.remove_item(button)
-                self.add_item(RenameOwnedAssetSelect(options))
+                self.add_item(RenameOwnedAssetSelect(options, self.asset_page + 1, page_count))
+                if page_count > 1:
+                    prev_button = discord.ui.Button(label="Previous Assets", style=discord.ButtonStyle.secondary, disabled=self.asset_page == 0)
+                    next_button = discord.ui.Button(label="Next Assets", style=discord.ButtonStyle.secondary, disabled=self.asset_page >= page_count - 1)
+                    async def prev_cb(page_interaction: discord.Interaction):
+                        self.asset_page = max(0, self.asset_page - 1)
+                        self.asset_id = None
+                        await self.rebuild(page_interaction, f"Showing asset page {self.asset_page + 1} of {page_count}.")
+                    async def next_cb(page_interaction: discord.Interaction):
+                        self.asset_page = min(page_count - 1, self.asset_page + 1)
+                        self.asset_id = None
+                        await self.rebuild(page_interaction, f"Showing asset page {self.asset_page + 1} of {page_count}.")
+                    prev_button.callback = prev_cb
+                    next_button.callback = next_cb
+                    self.add_item(prev_button)
+                    self.add_item(next_button)
                 self.add_item(button)
         embed = discord.Embed(
             title="Rename Asset",
@@ -3090,12 +3159,13 @@ class RenameAssetCharacterSelect(discord.ui.Select):
         if isinstance(view, RenameAssetView):
             view.character_id = int(self.values[0])
             view.asset_id = None
+            view.asset_page = 0
             await view.rebuild(interaction, "Character selected. Now choose an asset.")
 
 
 class RenameOwnedAssetSelect(discord.ui.Select):
-    def __init__(self, options: list[discord.SelectOption]):
-        super().__init__(placeholder="Choose an asset", min_values=1, max_values=1, options=options)
+    def __init__(self, options: list[discord.SelectOption], page: int = 1, page_count: int = 1):
+        super().__init__(placeholder=f"Choose an asset — page {page}/{page_count}", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
@@ -3128,6 +3198,7 @@ class SellAssetView(discord.ui.View):
         self.characters = characters
         self.character_id: Optional[int] = None
         self.asset_id: Optional[int] = None
+        self.asset_page: int = 0
         self.owned_assets: list[dict[str, Any]] = []
         self.refresh_items()
 
@@ -3161,8 +3232,11 @@ class SellAssetView(discord.ui.View):
         if self.character_id:
             self.owned_assets = await run_db(fetch_owned_assets_for_upgrade_sync, int(interaction.guild_id or GUILD_ID), self.character_id)
             if self.owned_assets:
+                page_count = max(1, (len(self.owned_assets) + 24) // 25)
+                self.asset_page = max(0, min(self.asset_page, page_count - 1))
+                start = self.asset_page * 25
                 asset_options: list[discord.SelectOption] = []
-                for a in self.owned_assets[:25]:
+                for a in self.owned_assets[start:start + 25]:
                     value = await run_db(asset_current_value_sync, a)
                     label = f"{clean_text(a.get('asset_name'))} — {clean_text(a.get('asset_type'))}"
                     desc_bits = []
@@ -3174,7 +3248,22 @@ class SellAssetView(discord.ui.View):
                     asset_options.append(discord.SelectOption(label=label[:100], value=str(a["id"]), description=" | ".join(desc_bits)[:100], default=(self.asset_id == int(a["id"]))))
                 old_submit = self.children[-1]
                 self.remove_item(old_submit)
-                self.add_item(SellOwnedAssetSelect(asset_options))
+                self.add_item(SellOwnedAssetSelect(asset_options, self.asset_page + 1, page_count))
+                if page_count > 1:
+                    prev_button = discord.ui.Button(label="Previous Assets", style=discord.ButtonStyle.secondary, disabled=self.asset_page == 0)
+                    next_button = discord.ui.Button(label="Next Assets", style=discord.ButtonStyle.secondary, disabled=self.asset_page >= page_count - 1)
+                    async def prev_cb(page_interaction: discord.Interaction):
+                        self.asset_page = max(0, self.asset_page - 1)
+                        self.asset_id = None
+                        await self.rebuild(page_interaction, f"Showing asset page {self.asset_page + 1} of {page_count}.")
+                    async def next_cb(page_interaction: discord.Interaction):
+                        self.asset_page = min(page_count - 1, self.asset_page + 1)
+                        self.asset_id = None
+                        await self.rebuild(page_interaction, f"Showing asset page {self.asset_page + 1} of {page_count}.")
+                    prev_button.callback = prev_cb
+                    next_button.callback = next_cb
+                    self.add_item(prev_button)
+                    self.add_item(next_button)
                 self.add_item(old_submit)
         embed = discord.Embed(
             title="Sell Asset",
@@ -3240,12 +3329,13 @@ class SellAssetCharacterSelect(discord.ui.Select):
         if isinstance(view, SellAssetView):
             view.character_id = int(self.values[0])
             view.asset_id = None
+            view.asset_page = 0
             await view.rebuild(interaction, "Character selected. Now choose an asset to sell.")
 
 
 class SellOwnedAssetSelect(discord.ui.Select):
-    def __init__(self, options: list[discord.SelectOption]):
-        super().__init__(placeholder="Choose owned asset to sell", min_values=1, max_values=1, options=options)
+    def __init__(self, options: list[discord.SelectOption], page: int = 1, page_count: int = 1):
+        super().__init__(placeholder=f"Choose owned asset to sell — page {page}/{page_count}", min_values=1, max_values=1, options=options)
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if isinstance(view, SellAssetView):
@@ -3253,7 +3343,7 @@ class SellOwnedAssetSelect(discord.ui.Select):
             await view.rebuild(interaction, "Asset selected. Press Sell Selected Asset to confirm the sale.")
 
 
-@tree.command(name="sell-asset", description="Sell one of your character's owned assets for its value minus location tax.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="sell-asset", description="Sell an owned asset minus kingdom tax; enchantments also incur magical regulation.", guild=discord.Object(id=GUILD_ID))
 async def sell_asset(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild_id = int(interaction.guild_id or GUILD_ID)
