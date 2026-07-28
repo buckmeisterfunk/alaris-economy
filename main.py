@@ -1,6 +1,8 @@
-# Alaris_EconomyBot_v039
+# Alaris_EconomyBot_v042
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
+# v042: Fixes refresh-queue upserts, rename confirmation regression, and migration gating.
+# v040: Flat 40% enchantment resale fee; collision-safe asset-name migration with audit/refresh; paginated upgrade assets.
 # v039: Enforces a 40% minimum enchantment-sale withholding with correct high-tax accounting, universal normalized asset names, any-asset rename confirmations, and paginated asset menus.
 # v038: Allows every owned asset to be renamed; enforces item-specific enchantment upgrades and normalized names; applies normal cumulative resale value plus kingdom tax and a 30% magical-regulation fee to enchantment sales.
 # v035: Fixes enchantment rank detection so tier labels such as "(1) Warding +1" are read as rank 1 rather than 11. Preserves all v034 behavior.
@@ -33,7 +35,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v039"
+APP_VERSION = "Alaris_EconomyBot_v042"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -49,7 +51,7 @@ CANON_KINGDOMS: list[str] = [
 ]
 
 DEFAULT_TAX_BP = 1000  # 10.00%
-MAGIC_REGULATORY_FEE_BP = 3000  # 30.00% on every enchantment sale
+ENCHANTMENT_RESALE_FEE_BP = 4000  # Flat 40.00% on every enchantment sale
 # Currency conversion, base unit = Ember.
 # 100 Embers = 1 Crown; 100 Crowns = 1 Sovereign; 100 Sovereigns = 1 Throne; 100 Thrones = 1 Astral.
 CURRENCY_UNITS: list[tuple[int, str, str]] = [
@@ -449,27 +451,74 @@ def ensure_schema_sync() -> None:
                 """
             )
             cur.execute("ALTER TABLE econ.assets ADD COLUMN IF NOT EXISTS acquisition_value_embers BIGINT;")
-            # v039: Normalize any legacy case-insensitive duplicate names before enforcing
-            # one player-facing asset name per character across every asset type.
+            # v040: Preserve and audit every automatic legacy-name repair. The generated
+            # suffix includes the immutable asset ID and is checked in a loop, so migration
+            # cannot collide with a pre-existing player-created name.
             cur.execute(
                 """
-                WITH ranked AS (
-                    SELECT id, asset_name,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY guild_id, character_id, lower(asset_name)
-                               ORDER BY id
-                           ) AS rn
-                    FROM econ.assets
-                )
-                UPDATE econ.assets a
-                   SET asset_name = LEFT(r.asset_name, 70) || ' (' || r.rn::text || ')',
-                       updated_at = NOW()
-                  FROM ranked r
-                 WHERE a.id = r.id AND r.rn > 1;
+                CREATE TABLE IF NOT EXISTS econ.schema_migrations (
+                    migration_key TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    details_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
                 """
             )
+
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS econ.asset_name_migration_audit (
+                    id BIGSERIAL PRIMARY KEY,
+                    asset_id BIGINT NOT NULL,
+                    guild_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    old_name TEXT NOT NULL,
+                    new_name TEXT NOT NULL,
+                    migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    logged_at TIMESTAMPTZ,
+                    UNIQUE (asset_id, old_name, new_name)
+                );
+                DO $$
+                DECLARE
+                    rec RECORD;
+                    candidate TEXT;
+                    suffix_no INTEGER;
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM econ.schema_migrations
+                        WHERE migration_key='v041_asset_name_normalization'
+                    ) THEN
+                        RETURN;
+                    END IF;
+                    FOR rec IN
+                        SELECT a.id, a.guild_id, a.character_id, a.asset_name
+                        FROM econ.assets a
+                        JOIN (
+                            SELECT guild_id, character_id, lower(asset_name) AS lname, MIN(id) AS keep_id
+                            FROM econ.assets
+                            GROUP BY guild_id, character_id, lower(asset_name)
+                            HAVING COUNT(*) > 1
+                        ) d ON d.guild_id=a.guild_id AND d.character_id=a.character_id
+                           AND d.lname=lower(a.asset_name)
+                        WHERE a.id <> d.keep_id
+                        ORDER BY a.id
+                    LOOP
+                        suffix_no := 0;
+                        LOOP
+                            candidate := LEFT(rec.asset_name, 65) || ' [Asset ' || rec.id::text ||
+                                         CASE WHEN suffix_no=0 THEN '' ELSE '-' || suffix_no::text END || ']';
+                            EXIT WHEN NOT EXISTS (
+                                SELECT 1 FROM econ.assets x
+                                WHERE x.guild_id=rec.guild_id AND x.character_id=rec.character_id
+                                  AND lower(x.asset_name)=lower(candidate) AND x.id<>rec.id
+                            );
+                            suffix_no := suffix_no + 1;
+                        END LOOP;
+                        UPDATE econ.assets SET asset_name=candidate, updated_at=NOW() WHERE id=rec.id;
+                        INSERT INTO econ.asset_name_migration_audit(asset_id,guild_id,character_id,old_name,new_name)
+                        VALUES(rec.id,rec.guild_id,rec.character_id,rec.asset_name,candidate)
+                        ON CONFLICT DO NOTHING;
+                    END LOOP;
+                END $$;
                 CREATE UNIQUE INDEX IF NOT EXISTS econ_assets_character_name_ci_uidx
                     ON econ.assets (guild_id, character_id, lower(asset_name));
                 """
@@ -570,6 +619,51 @@ def ensure_schema_sync() -> None:
                     requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     processed_at TIMESTAMPTZ
                 );
+                """
+            )
+            # Normalize the shared refresh queue before migration-driven refreshes.
+            cur.execute(
+                """
+                ALTER TABLE public.alaris_character_refresh_queue
+                    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending',
+                    ADD COLUMN IF NOT EXISTS error_text TEXT,
+                    ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+                WITH ranked AS (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY guild_id, character_id ORDER BY requested_at DESC, id DESC) AS rn
+                    FROM public.alaris_character_refresh_queue
+                    WHERE status='pending'
+                )
+                UPDATE public.alaris_character_refresh_queue q
+                   SET status='superseded', processed_at=NOW(), error_text='Superseded by newer pending refresh request.'
+                  FROM ranked r
+                 WHERE q.id=r.id AND r.rn>1;
+                CREATE UNIQUE INDEX IF NOT EXISTS alaris_character_refresh_queue_one_pending_uidx
+                    ON public.alaris_character_refresh_queue(guild_id, character_id)
+                    WHERE status='pending';
+                """
+            )
+
+            # Log and queue card refreshes for automatic migration renames exactly once.
+            cur.execute(
+                """
+                INSERT INTO econ.transactions(guild_id, character_id, actor_user_id, action, amount_embers, details_json)
+                SELECT guild_id, character_id, NULL, 'asset_name_migrated', 0,
+                       jsonb_build_object('asset_id',asset_id,'old_name',old_name,'new_name',new_name,'reason','case-insensitive duplicate repair')
+                FROM econ.asset_name_migration_audit
+                WHERE logged_at IS NULL;
+
+                INSERT INTO public.alaris_character_refresh_queue(guild_id, character_id, reason, status, requested_at)
+                SELECT DISTINCT guild_id, character_id, 'economy_asset_name_migration', 'pending', NOW()
+                FROM econ.asset_name_migration_audit
+                WHERE logged_at IS NULL
+                ON CONFLICT (guild_id,character_id) WHERE status='pending'
+                DO UPDATE SET reason=EXCLUDED.reason, requested_at=NOW(), error_text=NULL;
+
+                UPDATE econ.asset_name_migration_audit SET logged_at=NOW() WHERE logged_at IS NULL;
+
+                INSERT INTO econ.schema_migrations(migration_key,details_json)
+                VALUES('v041_asset_name_normalization', jsonb_build_object('status','complete'))
+                ON CONFLICT (migration_key) DO NOTHING;
                 """
             )
 
@@ -1065,8 +1159,14 @@ def enqueue_character_refresh_sync(guild_id: int, character_id: int, reason: str
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason, requested_at)
-                VALUES (%s, %s, %s, NOW());
+                INSERT INTO public.alaris_character_refresh_queue
+                    (guild_id, character_id, reason, status, requested_at, error_text)
+                VALUES (%s, %s, %s, 'pending', NOW(), NULL)
+                ON CONFLICT (guild_id, character_id) WHERE status='pending'
+                DO UPDATE SET
+                    reason=EXCLUDED.reason,
+                    requested_at=NOW(),
+                    error_text=NULL;
                 """,
                 (int(guild_id), int(character_id), str(reason or "economy_update")),
             )
@@ -2015,16 +2115,15 @@ def rename_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_use
                 })),
             )
         conn.commit()
-    queue_character_refresh_sync(guild_id, character_id, "asset_renamed")
+    enqueue_character_refresh_sync(guild_id, character_id, "asset_renamed")
     return {"ok": True, "old_name": old_name, "new_name": clean_name, "asset": asset}
 
 def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_id: int) -> dict[str, Any]:
     """Sell an owned asset immediately.
 
-    Sale proceeds use the asset's normal cumulative catalog value. Kingdom tax is
-    withheld using the asset location (or the character location as fallback) and
-    deposited into that treasury. Enchantments also incur a separate 30% magical
-    regulatory fee, which is removed from circulation rather than paid to a treasury.
+    Sale proceeds use the asset's normal cumulative catalog value. Enchantments
+    ignore kingdom tax and incur a flat 40% arcane resale fee, returning exactly
+    60% to the owner. Other assets use the applicable location tax.
     """
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -2089,28 +2188,27 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
                 return {"ok": False, "reason": "no_catalog_value"}
 
             location = clean_text(asset.get("kingdom")) or clean_text(asset.get("character_kingdom")) or "Unaffiliated"
-            cur.execute(
-                "SELECT tax_rate_bp FROM econ.kingdoms WHERE guild_id = %s AND kingdom = %s LIMIT 1;",
-                (guild_id, location),
-            )
-            tax_row = cur.fetchone()
-            tax_bp = max(0, int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP))
-            # Kingdom tax is credited to the treasury at the configured rate, capped
-            # at the gross sale value. Enchantments additionally lose a 30% magical
-            # regulatory fee, and total withholding can never be below 40%.
-            tax = min(gross, calc_tax(gross, tax_bp))
             is_enchantment = is_enchantment_asset_type(asset_type)
-            magic_fee_bp = MAGIC_REGULATORY_FEE_BP if is_enchantment else 0
-            minimum_total_bp = 4000 if is_enchantment else tax_bp
-            target_total_withheld = min(
-                gross,
-                max(
-                    calc_tax(gross, minimum_total_bp),
-                    tax + (calc_tax(gross, magic_fee_bp) if magic_fee_bp else 0),
-                ),
-            )
-            magic_regulatory_fee = max(0, target_total_withheld - tax) if is_enchantment else 0
-            total_withheld = min(gross, tax + magic_regulatory_fee)
+            # v040: Enchantments ignore kingdom tax and always return exactly 60% of
+            # cumulative catalog/acquisition value. The flat 40% arcane resale fee is
+            # removed from circulation and never credited to a kingdom treasury.
+            if is_enchantment:
+                tax_bp = 0
+                tax = 0
+                enchantment_resale_fee_bp = ENCHANTMENT_RESALE_FEE_BP
+                enchantment_resale_fee = calc_tax(gross, enchantment_resale_fee_bp)
+                total_withheld = min(gross, enchantment_resale_fee)
+            else:
+                cur.execute(
+                    "SELECT tax_rate_bp FROM econ.kingdoms WHERE guild_id = %s AND kingdom = %s LIMIT 1;",
+                    (guild_id, location),
+                )
+                tax_row = cur.fetchone()
+                tax_bp = max(0, int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP))
+                tax = min(gross, calc_tax(gross, tax_bp))
+                enchantment_resale_fee_bp = 0
+                enchantment_resale_fee = 0
+                total_withheld = tax
             net = max(0, gross - total_withheld)
 
             cur.execute(
@@ -2164,8 +2262,8 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
                         "gross_value_embers": gross,
                         "tax_embers": tax,
                         "tax_bp": tax_bp,
-                        "magic_regulatory_fee_embers": magic_regulatory_fee,
-                        "magic_regulatory_fee_bp": magic_fee_bp,
+                        "enchantment_resale_fee_embers": enchantment_resale_fee,
+                        "enchantment_resale_fee_bp": enchantment_resale_fee_bp,
                         "total_withheld_embers": total_withheld,
                         "net_embers": net,
                     }),
@@ -2173,8 +2271,14 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
             )
             cur.execute(
                 """
-                INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason, requested_at)
-                VALUES (%s, %s, 'economy_asset_sold', NOW());
+                INSERT INTO public.alaris_character_refresh_queue
+                    (guild_id, character_id, reason, status, requested_at, error_text)
+                VALUES (%s, %s, 'economy_asset_sold', 'pending', NOW(), NULL)
+                ON CONFLICT (guild_id, character_id) WHERE status='pending'
+                DO UPDATE SET
+                    reason=EXCLUDED.reason,
+                    requested_at=NOW(),
+                    error_text=NULL;
                 """,
                 (guild_id, character_id),
             )
@@ -2185,8 +2289,8 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
         "gross": gross,
         "tax": tax,
         "tax_bp": tax_bp,
-        "magic_regulatory_fee": magic_regulatory_fee,
-        "magic_regulatory_fee_bp": magic_fee_bp,
+        "enchantment_resale_fee": enchantment_resale_fee,
+        "enchantment_resale_fee_bp": enchantment_resale_fee_bp,
         "total_withheld": total_withheld,
         "net": net,
         "location": location,
@@ -2236,8 +2340,14 @@ def wipe_economy_test_data_sync(guild_id: int, actor_user_id: int) -> dict[str, 
             for cid in character_ids:
                 cur.execute(
                     """
-                    INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason, requested_at)
-                    VALUES (%s, %s, 'economy_test_wipe', NOW());
+                    INSERT INTO public.alaris_character_refresh_queue
+                        (guild_id, character_id, reason, status, requested_at, error_text)
+                    VALUES (%s, %s, 'economy_test_wipe', 'pending', NOW(), NULL)
+                    ON CONFLICT (guild_id, character_id) WHERE status='pending'
+                    DO UPDATE SET
+                        reason=EXCLUDED.reason,
+                        requested_at=NOW(),
+                        error_text=NULL;
                     """,
                     (guild_id, cid),
                 )
@@ -3267,7 +3377,7 @@ class SellAssetView(discord.ui.View):
                 self.add_item(old_submit)
         embed = discord.Embed(
             title="Sell Asset",
-            description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds use the asset's cumulative catalog value. Kingdom tax is withheld, and enchantments also incur a separate 30% magical-regulation fee.",
+            description="Choose one of your characters, then choose an owned asset to sell. Enchantments return exactly 60% of cumulative value after a flat 40% arcane resale fee. Other assets use the applicable location tax.",
             color=discord.Color.orange(),
         )
         if status:
@@ -3300,8 +3410,8 @@ class SellAssetView(discord.ui.View):
                 f"Asset: **{clean_text(asset.get('asset_name'))}** — {clean_text(asset.get('asset_type'))}",
                 f"Location: **{clean_text(result.get('location'))}**",
                 f"Gross value: **{format_currency(int(result['gross']))}**",
-                f"Kingdom tax: **{format_currency(int(result['tax']))}** ({bp_to_percent(int(result['tax_bp']))})",
-                *( [f"Magical-regulation fee: **{format_currency(int(result['magic_regulatory_fee']))}** ({bp_to_percent(int(result['magic_regulatory_fee_bp']))})"] if int(result.get('magic_regulatory_fee') or 0) else [] ),
+                *( [f"Kingdom tax: **{format_currency(int(result['tax']))}** ({bp_to_percent(int(result['tax_bp']))})"] if int(result.get('tax') or 0) else [] ),
+                *( [f"Arcane resale fee: **{format_currency(int(result['enchantment_resale_fee']))}** ({bp_to_percent(int(result['enchantment_resale_fee_bp']))})"] if int(result.get('enchantment_resale_fee') or 0) else [] ),
                 f"Total withheld: **{format_currency(int(result['total_withheld']))}**",
                 f"Net returned: **{format_currency(int(result['net']))}**",
                 f"New balance: **{format_currency(int(result['new_balance']))}**",
@@ -3311,8 +3421,8 @@ class SellAssetView(discord.ui.View):
         await interaction.followup.send(
             "\n".join([
                 f"Sold **{clean_text(asset.get('asset_name'))}** for **{format_currency(int(result['gross']))}** gross value.",
-                f"Kingdom tax ({bp_to_percent(int(result['tax_bp']))}) to **{clean_text(result.get('location'))}**: **{format_currency(int(result['tax']))}**",
-                *( [f"Magical-regulation fee ({bp_to_percent(int(result['magic_regulatory_fee_bp']))}): **{format_currency(int(result['magic_regulatory_fee']))}**"] if int(result.get('magic_regulatory_fee') or 0) else [] ),
+                *( [f"Kingdom tax ({bp_to_percent(int(result['tax_bp']))}) to **{clean_text(result.get('location'))}**: **{format_currency(int(result['tax']))}**"] if int(result.get('tax') or 0) else [] ),
+                *( [f"Arcane resale fee ({bp_to_percent(int(result['enchantment_resale_fee_bp']))}): **{format_currency(int(result['enchantment_resale_fee']))}**"] if int(result.get('enchantment_resale_fee') or 0) else [] ),
                 f"Total withheld: **{format_currency(int(result['total_withheld']))}**",
                 f"Returned to owner: **{format_currency(int(result['net']))}**",
                 f"New balance: **{format_currency(int(result['new_balance']))}**",
@@ -3343,7 +3453,7 @@ class SellOwnedAssetSelect(discord.ui.Select):
             await view.rebuild(interaction, "Asset selected. Press Sell Selected Asset to confirm the sale.")
 
 
-@tree.command(name="sell-asset", description="Sell an owned asset minus kingdom tax; enchantments also incur magical regulation.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="sell-asset", description="Sell an asset; enchantments return 60% after a flat 40% arcane fee.", guild=discord.Object(id=GUILD_ID))
 async def sell_asset(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild_id = int(interaction.guild_id or GUILD_ID)
@@ -3354,7 +3464,7 @@ async def sell_asset(interaction: discord.Interaction):
     view = SellAssetView(interaction.user.id, characters)
     embed = discord.Embed(
         title="Sell Asset",
-        description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds use the asset's cumulative catalog value. Kingdom tax is withheld, and enchantments also incur a separate 30% magical-regulation fee.",
+        description="Choose one of your characters, then choose an owned asset to sell. Enchantments return exactly 60% of cumulative value after a flat 40% arcane resale fee. Other assets use the applicable location tax.",
         color=discord.Color.orange(),
     )
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -4027,6 +4137,7 @@ class UpgradeAssetView(discord.ui.View):
         self.asset_id: Optional[int] = None
         self.target_tier: Optional[str] = None
         self.owned_assets: list[dict[str, Any]] = []
+        self.asset_page = 0
         self.refresh_base_items()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -4051,13 +4162,27 @@ class UpgradeAssetView(discord.ui.View):
         if self.character_id:
             self.owned_assets = await run_db(fetch_owned_assets_for_upgrade_sync, int(interaction.guild_id or GUILD_ID), self.character_id)
             if self.owned_assets:
+                page_count = max(1, (len(self.owned_assets) + 24) // 25)
+                self.asset_page = max(0, min(self.asset_page, page_count - 1))
+                page_assets = self.owned_assets[self.asset_page * 25:(self.asset_page + 1) * 25]
                 asset_options = []
-                for a in self.owned_assets[:25]:
+                for a in page_assets:
                     label = f"{a['asset_name']} — {a['asset_type']}"
                     asset_options.append(discord.SelectOption(label=clean_text(label)[:100], value=str(a["id"]), description=clean_text(a.get("tier_code"))[:100], default=(self.asset_id == int(a["id"]))))
                 old_submit = self.children[-1]
                 self.remove_item(old_submit)
                 self.add_item(UpgradeOwnedAssetSelect(asset_options))
+                if page_count > 1:
+                    prev_btn = discord.ui.Button(label="Previous Assets", style=discord.ButtonStyle.secondary, disabled=self.asset_page <= 0)
+                    next_btn = discord.ui.Button(label="Next Assets", style=discord.ButtonStyle.secondary, disabled=self.asset_page >= page_count - 1)
+                    async def prev_cb(i: discord.Interaction):
+                        self.asset_page = max(0, self.asset_page - 1); self.asset_id = None; self.target_tier = None
+                        await self.rebuild(i, f"Showing asset page {self.asset_page + 1} of {page_count}.")
+                    async def next_cb(i: discord.Interaction):
+                        self.asset_page = min(page_count - 1, self.asset_page + 1); self.asset_id = None; self.target_tier = None
+                        await self.rebuild(i, f"Showing asset page {self.asset_page + 1} of {page_count}.")
+                    prev_btn.callback = prev_cb; next_btn.callback = next_cb
+                    self.add_item(prev_btn); self.add_item(next_btn)
                 if self.asset_id:
                     selected = next((a for a in self.owned_assets if int(a["id"]) == int(self.asset_id)), None)
                     if selected:
@@ -4155,6 +4280,7 @@ class UpgradeCharacterSelect(discord.ui.Select):
             view.character_id = int(self.values[0])
             view.asset_id = None
             view.target_tier = None
+            view.asset_page = 0
             await view.rebuild(interaction, "Character selected. Now choose an owned asset.")
 
 
