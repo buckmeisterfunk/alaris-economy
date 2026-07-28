@@ -1,6 +1,7 @@
-# Alaris_EconomyBot_v035
+# Alaris_EconomyBot_v038
 # Full replacement for main.py
 # Purpose: standalone Alaris Economy Bot using shared Postgres.
+# v038: Allows every owned asset to be renamed; enforces item-specific enchantment upgrades and normalized names; applies normal cumulative resale value plus kingdom tax and a 30% magical-regulation fee to enchantment sales.
 # v035: Fixes enchantment rank detection so tier labels such as "(1) Warding +1" are read as rank 1 rather than 11. Preserves all v034 behavior.
 # Safety rules:
 # - Additive schema only.
@@ -31,7 +32,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-APP_VERSION = "Alaris_EconomyBot_v035"
+APP_VERSION = "Alaris_EconomyBot_v038"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 DEVELOPER_ROLE_ID = 1505626082701738165
 
@@ -47,6 +48,7 @@ CANON_KINGDOMS: list[str] = [
 ]
 
 DEFAULT_TAX_BP = 1000  # 10.00%
+MAGIC_REGULATORY_FEE_BP = 3000  # 30.00% on every enchantment sale
 # Currency conversion, base unit = Ember.
 # 100 Embers = 1 Crown; 100 Crowns = 1 Sovereign; 100 Sovereigns = 1 Throne; 100 Thrones = 1 Astral.
 CURRENCY_UNITS: list[tuple[int, str, str]] = [
@@ -1752,10 +1754,11 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     """
                     SELECT 1
                     FROM econ.assets
-                    WHERE guild_id = %s AND character_id = %s AND asset_type = %s AND asset_name = %s
+                    WHERE guild_id = %s AND character_id = %s
+                      AND lower(asset_name) = lower(%s)
                     LIMIT 1;
                     """,
-                    (guild_id, character_id, req["asset_type"], req["asset_name"]),
+                    (guild_id, character_id, req["asset_name"]),
                 )
                 if cur.fetchone():
                     conn.rollback()
@@ -1765,11 +1768,11 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     INSERT INTO econ.assets (
                         guild_id, character_id, asset_type, tier_code, asset_name, kingdom,
                         income_embers, created_by_user_id, prestige_tier, title_style, display_title, domain_name,
-                        combat_bonus_type, combat_bonus_value, combat_bonus_scope, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        combat_bonus_type, combat_bonus_value, combat_bonus_scope, acquisition_value_embers, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING id;
                     """,
-                    (guild_id, character_id, req["asset_type"], req["to_tier_code"], req["asset_name"], req.get("kingdom"), int(req.get("income_embers") or 0), staff_user_id, req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope")),
+                    (guild_id, character_id, req["asset_type"], req["to_tier_code"], req["asset_name"], req.get("kingdom"), int(req.get("income_embers") or 0), staff_user_id, req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope"), cost),
                 )
                 asset_id = int(cur.fetchone()["id"])
             elif req["request_type"] == "upgrade":
@@ -1792,7 +1795,11 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                     return {"ok": False, "reason": "asset_type_mismatch"}
                 cur_rank = tier_rank(str(asset["tier_code"]))
                 tgt_rank = tier_rank(str(req["to_tier_code"]))
-                if cur_rank is not None and tgt_rank is not None and tgt_rank <= cur_rank:
+                if is_enchantment_asset_type(str(asset["asset_type"])):
+                    if cur_rank is None or tgt_rank is None or tgt_rank != cur_rank + 1:
+                        conn.rollback()
+                        return {"ok": False, "reason": "invalid_upgrade_target"}
+                elif cur_rank is not None and tgt_rank is not None and tgt_rank <= cur_rank:
                     conn.rollback()
                     return {"ok": False, "reason": "invalid_upgrade_target"}
                 cur.execute(
@@ -1808,14 +1815,14 @@ def approve_asset_request_sync(guild_id: int, request_id: int, staff_user_id: in
                         combat_bonus_type = %s,
                         combat_bonus_value = %s,
                         combat_bonus_scope = %s,
-                        acquisition_value_embers = CASE
-                            WHEN acquisition_value_embers IS NULL THEN NULL
-                            ELSE acquisition_value_embers + %s
-                        END,
+                        acquisition_value_embers = COALESCE(
+                            acquisition_value_embers,
+                            %s
+                        ) + %s,
                         updated_at = NOW()
                     WHERE guild_id = %s AND id = %s;
                     """,
-                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope"), cost, guild_id, asset_id),
+                    (req["to_tier_code"], req.get("kingdom"), int(req.get("income_embers") or 0), req.get("prestige_tier"), req.get("title_style"), req.get("display_title"), req.get("domain_name"), req.get("combat_bonus_type"), req.get("combat_bonus_value"), req.get("combat_bonus_scope"), asset_current_value_sync(dict(asset)), cost, guild_id, asset_id),
                 )
             else:
                 conn.rollback()
@@ -1947,9 +1954,6 @@ def rename_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_use
             if int(asset.get("owner_user_id") or 0) != int(actor_user_id):
                 conn.rollback()
                 return {"ok": False, "reason": "not_owner"}
-            if str(asset.get("asset_type") or "") not in ENCHANTMENT_ASSET_TYPES:
-                conn.rollback()
-                return {"ok": False, "reason": "only_enchantments_renameable"}
             cur.execute(
                 """
                 SELECT EXISTS(
@@ -1991,10 +1995,10 @@ def rename_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_use
 def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_id: int) -> dict[str, Any]:
     """Sell an owned asset immediately.
 
-    Sale proceeds are the asset's current catalog value minus the tax rate of the
-    asset's location kingdom/land. If the asset has no stored location, the
-    character's assigned kingdom/land is used as a fallback. The tax portion is
-    deposited into that kingdom/land treasury.
+    Sale proceeds use the asset's normal cumulative catalog value. Kingdom tax is
+    withheld using the asset location (or the character location as fallback) and
+    deposited into that treasury. Enchantments also incur a separate 30% magical
+    regulatory fee, which is removed from circulation rather than paid to a treasury.
     """
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -2066,7 +2070,10 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
             tax_row = cur.fetchone()
             tax_bp = int(tax_row["tax_rate_bp"] if tax_row else DEFAULT_TAX_BP)
             tax = calc_tax(gross, tax_bp)
-            net = max(0, gross - tax)
+            magic_fee_bp = MAGIC_REGULATORY_FEE_BP if is_enchantment_asset_type(asset_type) else 0
+            magic_regulatory_fee = calc_tax(gross, magic_fee_bp) if magic_fee_bp else 0
+            total_withheld = min(gross, tax + magic_regulatory_fee)
+            net = max(0, gross - total_withheld)
 
             cur.execute(
                 """
@@ -2119,6 +2126,9 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
                         "gross_value_embers": gross,
                         "tax_embers": tax,
                         "tax_bp": tax_bp,
+                        "magic_regulatory_fee_embers": magic_regulatory_fee,
+                        "magic_regulatory_fee_bp": magic_fee_bp,
+                        "total_withheld_embers": total_withheld,
                         "net_embers": net,
                     }),
                 ),
@@ -2137,6 +2147,9 @@ def sell_asset_sync(guild_id: int, character_id: int, asset_id: int, actor_user_
         "gross": gross,
         "tax": tax,
         "tax_bp": tax_bp,
+        "magic_regulatory_fee": magic_regulatory_fee,
+        "magic_regulatory_fee_bp": magic_fee_bp,
+        "total_withheld": total_withheld,
         "net": net,
         "location": location,
         "new_balance": new_balance,
@@ -2953,10 +2966,10 @@ async def econ_transfer(interaction: discord.Interaction, source_character: str,
 
 
 
-class RenameAssetModal(discord.ui.Modal, title="Rename Enchanted Item"):
+class RenameAssetModal(discord.ui.Modal, title="Rename Asset"):
     new_name = discord.ui.TextInput(
-        label="New item name",
-        placeholder="Example: Dawnward Blade",
+        label="New asset name",
+        placeholder="Example: Dawnward Blade or The Silver Stag",
         min_length=1,
         max_length=80,
     )
@@ -2980,13 +2993,12 @@ class RenameAssetModal(discord.ui.Modal, title="Rename Enchanted Item"):
         if not result.get("ok"):
             reason = clean_text(result.get("reason") or "unknown")
             messages = {
-                "blank_name": "Enter a name for the enchanted item.",
-                "asset_not_found": "That enchanted item could not be found.",
-                "not_owner": "You do not own that enchanted item.",
-                "only_enchantments_renameable": "Only enchanted items can be renamed with this command.",
+                "blank_name": "Enter a name for the asset.",
+                "asset_not_found": "That asset could not be found.",
+                "not_owner": "You do not own that asset.",
                 "duplicate_name": "That character already owns an asset with that name.",
             }
-            await interaction.followup.send(messages.get(reason, "The enchanted item could not be renamed."), ephemeral=True)
+            await interaction.followup.send(messages.get(reason, "The asset could not be renamed."), ephemeral=True)
             return
         await log_to_channel(
             "asset_renamed",
@@ -3031,10 +3043,10 @@ class RenameAssetView(discord.ui.View):
         ]
         if options:
             self.add_item(RenameAssetCharacterSelect(options))
-        button = discord.ui.Button(label="Rename Selected Item", style=discord.ButtonStyle.primary, disabled=not (self.character_id and self.asset_id))
+        button = discord.ui.Button(label="Rename Selected Asset", style=discord.ButtonStyle.primary, disabled=not (self.character_id and self.asset_id))
         async def button_cb(interaction: discord.Interaction):
             if not (self.character_id and self.asset_id):
-                await interaction.response.send_message("Choose a character and enchanted item first.", ephemeral=True)
+                await interaction.response.send_message("Choose a character and asset first.", ephemeral=True)
                 return
             await interaction.response.send_modal(RenameAssetModal(self.character_id, self.asset_id))
         button.callback = button_cb
@@ -3044,8 +3056,8 @@ class RenameAssetView(discord.ui.View):
         self.refresh_items()
         if self.character_id:
             assets = await run_db(fetch_owned_assets_for_upgrade_sync, int(interaction.guild_id or GUILD_ID), self.character_id)
-            enchantments = [a for a in assets if str(a.get("asset_type") or "") in ENCHANTMENT_ASSET_TYPES]
-            if enchantments:
+            renameable_assets = assets
+            if renameable_assets:
                 options = [
                     discord.SelectOption(
                         label=f"{clean_text(a.get('asset_name'))} — {clean_text(a.get('tier_code'))}"[:100],
@@ -3053,15 +3065,15 @@ class RenameAssetView(discord.ui.View):
                         description=clean_text(a.get("asset_type"))[:100],
                         default=(self.asset_id == int(a["id"])),
                     )
-                    for a in enchantments[:25]
+                    for a in renameable_assets[:25]
                 ]
                 button = self.children[-1]
                 self.remove_item(button)
                 self.add_item(RenameOwnedAssetSelect(options))
                 self.add_item(button)
         embed = discord.Embed(
-            title="Rename Enchanted Item",
-            description="Choose one of your characters, then choose an owned enchantment and give it a new item name.",
+            title="Rename Asset",
+            description="Choose one of your characters, then choose any owned asset and give it a new name.",
             color=discord.Color.blurple(),
         )
         if status:
@@ -3078,21 +3090,21 @@ class RenameAssetCharacterSelect(discord.ui.Select):
         if isinstance(view, RenameAssetView):
             view.character_id = int(self.values[0])
             view.asset_id = None
-            await view.rebuild(interaction, "Character selected. Now choose an enchanted item.")
+            await view.rebuild(interaction, "Character selected. Now choose an asset.")
 
 
 class RenameOwnedAssetSelect(discord.ui.Select):
     def __init__(self, options: list[discord.SelectOption]):
-        super().__init__(placeholder="Choose an enchanted item", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Choose an asset", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if isinstance(view, RenameAssetView):
             view.asset_id = int(self.values[0])
-            await view.rebuild(interaction, "Item selected. Press Rename Selected Item.")
+            await view.rebuild(interaction, "Asset selected. Press Rename Selected Asset.")
 
 
-@tree.command(name="rename-enchanted-item", description="Rename one of your character's enchanted items.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="rename-asset", description="Rename any asset owned by one of your characters.", guild=discord.Object(id=GUILD_ID))
 async def rename_asset(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild_id = int(interaction.guild_id or GUILD_ID)
@@ -3102,8 +3114,8 @@ async def rename_asset(interaction: discord.Interaction):
         return
     view = RenameAssetView(interaction.user.id, characters)
     embed = discord.Embed(
-        title="Rename Enchanted Item",
-        description="Choose one of your characters, then choose an owned enchantment and give it a new item name.",
+        title="Rename Asset",
+        description="Choose one of your characters, then choose any owned asset and give it a new name.",
         color=discord.Color.blurple(),
     )
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -3166,7 +3178,7 @@ class SellAssetView(discord.ui.View):
                 self.add_item(old_submit)
         embed = discord.Embed(
             title="Sell Asset",
-            description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds return the asset's current catalog value minus the tax rate of the asset's location kingdom/land.",
+            description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds use the asset's cumulative catalog value. Kingdom tax is withheld, and enchantments also incur a separate 30% magical-regulation fee.",
             color=discord.Color.orange(),
         )
         if status:
@@ -3182,7 +3194,14 @@ class SellAssetView(discord.ui.View):
         result = await run_db(sell_asset_sync, guild_id, int(self.character_id), int(self.asset_id), int(interaction.user.id))
         if not result.get("ok"):
             reason = clean_text(result.get("reason") or "unknown")
-            await interaction.followup.send(f"Asset sale could not be completed: `{reason}`.", ephemeral=True)
+            messages = {
+                "asset_not_found": "That asset could not be found.",
+                "character_not_found": "The owning character could not be found.",
+                "not_owner": "You do not own that asset.",
+                "asset_not_sellable": "That asset cannot be sold.",
+                "no_catalog_value": "That asset has no catalog resale value.",
+            }
+            await interaction.followup.send(messages.get(reason, "The asset sale could not be completed."), ephemeral=True)
             return
         asset = result["asset"]
         await log_to_channel(
@@ -3192,7 +3211,9 @@ class SellAssetView(discord.ui.View):
                 f"Asset: **{clean_text(asset.get('asset_name'))}** — {clean_text(asset.get('asset_type'))}",
                 f"Location: **{clean_text(result.get('location'))}**",
                 f"Gross value: **{format_currency(int(result['gross']))}**",
-                f"Tax: **{format_currency(int(result['tax']))}** ({bp_to_percent(int(result['tax_bp']))})",
+                f"Kingdom tax: **{format_currency(int(result['tax']))}** ({bp_to_percent(int(result['tax_bp']))})",
+                *( [f"Magical-regulation fee: **{format_currency(int(result['magic_regulatory_fee']))}** ({bp_to_percent(int(result['magic_regulatory_fee_bp']))})"] if int(result.get('magic_regulatory_fee') or 0) else [] ),
+                f"Total withheld: **{format_currency(int(result['total_withheld']))}**",
                 f"Net returned: **{format_currency(int(result['net']))}**",
                 f"New balance: **{format_currency(int(result['new_balance']))}**",
                 f"Sold by: **{clean_text(getattr(interaction.user, 'display_name', interaction.user.name))}** (`{interaction.user.id}`)",
@@ -3202,6 +3223,8 @@ class SellAssetView(discord.ui.View):
             "\n".join([
                 f"Sold **{clean_text(asset.get('asset_name'))}** for **{format_currency(int(result['gross']))}** gross value.",
                 f"Kingdom tax ({bp_to_percent(int(result['tax_bp']))}) to **{clean_text(result.get('location'))}**: **{format_currency(int(result['tax']))}**",
+                *( [f"Magical-regulation fee ({bp_to_percent(int(result['magic_regulatory_fee_bp']))}): **{format_currency(int(result['magic_regulatory_fee']))}**"] if int(result.get('magic_regulatory_fee') or 0) else [] ),
+                f"Total withheld: **{format_currency(int(result['total_withheld']))}**",
                 f"Returned to owner: **{format_currency(int(result['net']))}**",
                 f"New balance: **{format_currency(int(result['new_balance']))}**",
             ]),
@@ -3241,7 +3264,7 @@ async def sell_asset(interaction: discord.Interaction):
     view = SellAssetView(interaction.user.id, characters)
     embed = discord.Embed(
         title="Sell Asset",
-        description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds return the asset's current catalog value minus the tax rate of the asset's location kingdom/land.",
+        description="Choose one of your characters, then choose an owned asset to sell. Sale proceeds use the asset's cumulative catalog value. Kingdom tax is withheld, and enchantments also incur a separate 30% magical-regulation fee.",
         color=discord.Color.orange(),
     )
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
